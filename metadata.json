@@ -1,0 +1,6 @@
+{
+  "name": "Torrent Tracker",
+  "description": "Native multi-source torrent discovery, metadata explorer, source repair assistant, and categorized favorites library.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
