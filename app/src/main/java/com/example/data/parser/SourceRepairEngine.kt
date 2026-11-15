@@ -16,19 +16,22 @@ class SourceRepairEngine(
   suspend fun diagnoseSource(source: TorrentSource, timeoutSeconds: Int = 10): SourceDiagnosticReport {
     val checkedAt = System.currentTimeMillis()
     val testEndpoint = adapter.buildRequestUrl(source, "ubuntu", 1)
+    val allowHttp = source.allowCleartextHttp
 
     // Step 1: Probe endpoint without following redirects to detect 301/302/307/308 explicitly
     val endpointNoRedirect = httpClient.fetch(
       url = testEndpoint,
       timeoutSeconds = timeoutSeconds,
-      followRedirects = false
+      followRedirects = false,
+      allowCleartext = allowHttp
     )
 
     // Step 2: Probe base domain reachability
     val baseReachableProbe = httpClient.fetch(
       url = source.baseUrl,
       timeoutSeconds = timeoutSeconds,
-      followRedirects = true
+      followRedirects = true,
+      allowCleartext = allowHttp
     )
 
     val redirectChain = mutableListOf<String>()
@@ -38,41 +41,70 @@ class SourceRepairEngine(
     val domainReachable = baseReachableProbe.statusCode != null || endpointNoRedirect.statusCode != null
 
     // Step 3: Follow redirects on test endpoint to check final destination and parser output
-    val fullOutcome = adapter.fetchPage(source, "ubuntu", 1, timeoutSeconds)
+    val fullOutcome = adapter.fetchPage(
+      source = source,
+      query = "ubuntu",
+      page = 1,
+      timeoutSeconds = timeoutSeconds,
+      allowCleartext = allowHttp
+    )
     if (fullOutcome.redirectChain.isNotEmpty()) {
       redirectChain.addAll(fullOutcome.redirectChain)
     }
 
-    val verifiedReplacements = mutableListOf<VerifiedReplacement>()
+    val replacementCandidates = mutableListOf<VerifiedReplacement>()
 
-    // Check if an HTTP 301/302 redirect points to a new authoritative URL on same host or HTTPS upgrade
+    // Check if an HTTP 301/302 redirect points to a new authoritative URL on same/parent host
     val redirectLocation = endpointNoRedirect.redirectChain.firstOrNull()?.substringAfter("-> ")?.trim()
     if (endpointNoRedirect.statusCode in 300..399 && !redirectLocation.isNullOrBlank()) {
-      val verified = verifyCandidateReplacement(
+      val checked = verifyCandidateReplacement(
         source = source,
         candidateUrl = redirectLocation,
-        label = "Verified Redirect Target (HTTP ${endpointNoRedirect.statusCode})",
+        label = "Redirect Target (HTTP ${endpointNoRedirect.statusCode})",
         timeoutSeconds = timeoutSeconds
       )
-      if (verified != null) verifiedReplacements.add(verified)
+      if (checked != null) replacementCandidates.add(checked)
     }
 
-    // Check HTTPS upgrade if currently using HTTP
+    // Check HTTPS upgrade if currently using HTTP — actually parse before marking verified
     if (!source.isHttps) {
       val httpsBase = source.baseUrl.replaceFirst("http://", "https://", ignoreCase = true)
       val httpsFeed = source.feedUrl.replaceFirst("http://", "https://", ignoreCase = true)
       val httpsSearch = source.searchUrlTemplate.replaceFirst("http://", "https://", ignoreCase = true)
-      val candidateTest = httpsSearch.ifBlank { httpsFeed.ifBlank { httpsBase } }
-      val probe = httpClient.fetch(candidateTest.replace("{query}", "ubuntu").replace("{page}", "1"), timeoutSeconds)
-      if (probe.isSuccessful) {
-        verifiedReplacements.add(
+      val httpsSource = source.copy(
+        baseUrl = httpsBase,
+        searchUrlTemplate = httpsSearch,
+        feedUrl = httpsFeed,
+        allowCleartextHttp = false
+      )
+      val outcome = adapter.fetchPage(
+        source = httpsSource,
+        query = "ubuntu",
+        page = 1,
+        timeoutSeconds = timeoutSeconds,
+        forceNetwork = true,
+        allowCleartext = false
+      )
+      if (outcome.statusCode != null && outcome.statusCode in 200..299) {
+        val verified = outcome.errorMessage == null && outcome.items.isNotEmpty()
+        replacementCandidates.add(
           VerifiedReplacement(
-            label = "Encrypted HTTPS Upgrade",
+            label = if (verified) "Verified HTTPS Upgrade" else "Suggested HTTPS Upgrade (Needs Check)",
             replacementBaseUrl = httpsBase,
             replacementSearchTemplate = httpsSearch.ifBlank { null },
             replacementFeedUrl = httpsFeed.ifBlank { null },
             detectedSourceType = source.sourceType,
-            verificationSummary = "Verified HTTPS endpoint responded with HTTP ${probe.statusCode}."
+            verificationSummary = if (verified) {
+              "Verified HTTPS endpoint returned HTTP ${outcome.statusCode} and parsed ${outcome.items.size} entries."
+            } else {
+              "HTTPS responded HTTP ${outcome.statusCode}, but parsing reported: ${outcome.errorMessage ?: "0 items extracted"}."
+            },
+            isVerified = verified,
+            reason = if (verified) {
+              "Fetched over TLS and parsed ${outcome.items.size} valid items."
+            } else {
+              "Endpoint reachable over HTTPS, but parser did not confirm extracted items."
+            }
           )
         )
       }
@@ -84,23 +116,30 @@ class SourceRepairEngine(
       for (feed in detectedFeeds) {
         if (feed.url != source.feedUrl && isSameOrParentDomain(source.baseUrl, feed.url)) {
           val testFeedSource = source.copy(feedUrl = feed.url, sourceType = feed.type)
-          val feedTest = adapter.fetchPage(testFeedSource, "", 1, timeoutSeconds)
-          if (feedTest.errorMessage == null && feedTest.items.isNotEmpty()) {
-            verifiedReplacements.add(
+          val feedTest = adapter.fetchPage(testFeedSource, "", 1, timeoutSeconds, allowCleartext = allowHttp)
+          val verified = feedTest.errorMessage == null && feedTest.items.isNotEmpty()
+          if (feedTest.errorMessage == null) {
+            replacementCandidates.add(
               VerifiedReplacement(
-                label = "Discovered Feed: ${feed.title}",
+                label = if (verified) "Verified Feed: ${feed.title}" else "Suggested Feed: ${feed.title}",
                 replacementBaseUrl = baseReachableProbe.finalUrl,
                 replacementSearchTemplate = null,
                 replacementFeedUrl = feed.url,
                 detectedSourceType = feed.type,
-                verificationSummary = "Verified feed returned ${feedTest.items.size} items."
+                verificationSummary = if (verified) {
+                  "Verified feed returned ${feedTest.items.size} parsed items."
+                } else {
+                  "Valid feed detected at ${feed.url}, currently contains 0 items."
+                },
+                isVerified = verified,
+                reason = if (verified) "Fetched and parsed ${feedTest.items.size} feed entries." else "Feed parsed without errors but had 0 items."
               )
             )
           }
         }
       }
 
-      // Check HTML <form> search endpoint on base page if search failed
+      // Check HTML <form> search endpoint on base page if search failed — probe & parse before marking verified
       if (fullOutcome.errorMessage != null) {
         val doc = Jsoup.parse(baseReachableProbe.body, baseReachableProbe.finalUrl)
         val searchForm = doc.selectFirst("form[action*=search], form:has(input[type=search]), form:has(input[name=q]), form:has(input[name=s])")
@@ -109,14 +148,32 @@ class SourceRepairEngine(
         if (!action.isNullOrBlank() && !inputName.isNullOrBlank() && isSameOrParentDomain(source.baseUrl, action)) {
           val separator = if (action.contains("?")) "&" else "?"
           val candidateTemplate = "$action${separator}$inputName={query}"
-          verifiedReplacements.add(
+          val candidateSource = source.copy(
+            baseUrl = baseReachableProbe.finalUrl,
+            searchUrlTemplate = candidateTemplate,
+            sourceType = SourceType.HTML_SELECTOR
+          )
+          val formTest = adapter.fetchPage(candidateSource, "ubuntu", 1, timeoutSeconds, allowCleartext = allowHttp)
+          val verified = formTest.errorMessage == null && formTest.items.isNotEmpty()
+          val pathLabel = runCatching { URI(action).path.ifBlank { "/" } }.getOrDefault(action)
+          replacementCandidates.add(
             VerifiedReplacement(
-              label = "Detected On-Site Search Endpoint",
+              label = if (verified) "Verified Search Endpoint" else "Suggested Search Form Endpoint",
               replacementBaseUrl = baseReachableProbe.finalUrl,
               replacementSearchTemplate = candidateTemplate,
               replacementFeedUrl = null,
               detectedSourceType = SourceType.HTML_SELECTOR,
-              verificationSummary = "Found <form> search input '$inputName' at ${URI(action).path}."
+              verificationSummary = if (verified) {
+                "Verified search form '$inputName' at $pathLabel returned ${formTest.items.size} items."
+              } else {
+                "Found <form> search input '$inputName' at $pathLabel, but test fetch returned: ${formTest.errorMessage ?: "0 items extracted"}."
+              },
+              isVerified = verified,
+              reason = if (verified) {
+                "Form endpoint was fetched and parsed successfully."
+              } else {
+                "Discovered from HTML <form> only; test and verify selectors before relying on it."
+              }
             )
           )
         }
@@ -128,7 +185,8 @@ class SourceRepairEngine(
 
     // If HTML selector parsing failed on an HTTP 200 page, auto-analyze the DOM for repeating containers/selectors
     if (parsingIssue && source.sourceType == SourceType.HTML_SELECTOR && baseReachableProbe.isSuccessful && !baseReachableProbe.body.isNullOrBlank()) {
-      val endpointBody = httpClient.fetch(testEndpoint, timeoutSeconds).body ?: baseReachableProbe.body
+      val endpointFetch = httpClient.fetch(testEndpoint, timeoutSeconds, allowCleartext = allowHttp)
+      val endpointBody = endpointFetch.body ?: baseReachableProbe.body
       val analysis = adapter.analyzeHtmlStructure(
         html = endpointBody,
         finalUrl = fullOutcome.finalUrl ?: baseReachableProbe.finalUrl,
@@ -139,15 +197,17 @@ class SourceRepairEngine(
       isSpaPage = analysis.isLikelySpa
       val suggested = analysis.suggestedConfig
       if (suggested != null && analysis.extractedCount > 0) {
-        verifiedReplacements.add(
+        replacementCandidates.add(
           VerifiedReplacement(
-            label = "Auto-Detected HTML Selectors",
+            label = "Verified Auto-Detected HTML Selectors",
             replacementBaseUrl = source.baseUrl,
             replacementSearchTemplate = null,
             replacementFeedUrl = null,
             detectedSourceType = SourceType.HTML_SELECTOR,
             replacementHtmlSelectors = suggested,
-            verificationSummary = "Matched container '${suggested.itemContainer}' and extracted ${analysis.extractedCount} entries."
+            verificationSummary = "Matched container '${suggested.itemContainer}' and extracted ${analysis.extractedCount} entries.",
+            isVerified = true,
+            reason = "Tested CSS selectors against live page DOM and parsed ${analysis.extractedCount} distinct items."
           )
         )
       }
@@ -172,12 +232,12 @@ class SourceRepairEngine(
         add("Edit the source URL manually if the project migrated to a new official domain.")
       }
       if (endpointNoRedirect.statusCode in 300..399) {
-        add("Review and test the verified redirect URL below before applying it.")
+        add("Review and test the redirect target below before applying it.")
       }
       if (isSpaPage) {
         add("Static HTML scraping cannot read JavaScript-rendered listings. Check if the site offers a JSON API or RSS feed URL, or open it in your browser.")
       } else if (parsingIssue) {
-        add("The page layout or selectors do not match. Apply the auto-detected selectors below (if found) or tap 'Edit Selectors' to customize them.")
+        add("The page layout or selectors do not match. Apply verified selectors below (if available) or tap 'Edit Selectors' to customize them.")
       }
       if (!source.previousWorkingConfigJson.isNullOrBlank()) {
         add("You can restore your previous working configuration at any time.")
@@ -196,14 +256,21 @@ class SourceRepairEngine(
       isSpaPage = isSpaPage,
       issueSummary = issueSummary,
       recommendedActions = recommendations,
-      verifiedReplacements = verifiedReplacements.distinctBy {
-        "${it.replacementBaseUrl}|${it.replacementSearchTemplate}|${it.replacementFeedUrl}|${it.replacementHtmlSelectors?.itemContainer}"
-      }
+      verifiedReplacements = replacementCandidates
+        .distinctBy {
+          "${it.replacementBaseUrl}|${it.replacementSearchTemplate}|${it.replacementFeedUrl}|${it.replacementHtmlSelectors?.itemContainer}"
+        }
+        .sortedByDescending { it.isVerified }
     )
   }
 
   suspend fun testCandidateUrl(url: String, source: TorrentSource, timeoutSeconds: Int = 10): String {
-    val probe = httpClient.fetch(url.replace("{query}", "ubuntu").replace("{page}", "1"), timeoutSeconds)
+    val probe = httpClient.fetch(
+      url = url.replace("{query}", "ubuntu").replace("{page}", "1"),
+      timeoutSeconds = timeoutSeconds,
+      forceNetwork = true,
+      allowCleartext = true
+    )
     return when {
       probe.isCloudflareChallenge -> "Cloudflare challenge encountered (HTTP ${probe.statusCode}). Verification needed."
       probe.isSuccessful -> {
@@ -212,9 +279,9 @@ class SourceRepairEngine(
           else -> source.copy(searchUrlTemplate = url)
         }
         val parsed = when (candidateSource.sourceType) {
-          SourceType.RSS_ATOM -> adapter.parseRssOrAtom(candidateSource, probe.body.orEmpty(), "")
-          SourceType.JSON_API -> adapter.parseJsonApi(candidateSource, probe.body.orEmpty(), "", 1)
-          SourceType.HTML_SELECTOR -> adapter.parseHtmlWithSelectors(candidateSource, probe.body.orEmpty(), probe.finalUrl, "")
+          SourceType.RSS_ATOM -> adapter.parseRssOrAtom(candidateSource, probe.body.orEmpty(), "", 1, probe.finalUrl)
+          SourceType.JSON_API -> adapter.parseJsonApi(candidateSource, probe.body.orEmpty(), "", 1, probe.finalUrl)
+          SourceType.HTML_SELECTOR -> adapter.parseHtmlWithSelectors(candidateSource, probe.body.orEmpty(), probe.finalUrl, "", 1)
         }
         if (parsed.parseError != null) {
           "HTTP ${probe.statusCode} OK, but parser reported: ${parsed.parseError}"
@@ -234,19 +301,44 @@ class SourceRepairEngine(
   ): VerifiedReplacement? {
     val resolved = runCatching { URI(source.baseUrl).resolve(candidateUrl).toString() }.getOrNull() ?: return null
     if (!isSameOrParentDomain(source.baseUrl, resolved)) return null
-    val probe = httpClient.fetch(resolved, timeoutSeconds = timeoutSeconds)
+    val probe = httpClient.fetch(resolved, timeoutSeconds = timeoutSeconds, allowCleartext = source.allowCleartextHttp)
     if (!probe.isSuccessful) return null
+
     val base = runCatching {
       val u = URI(probe.finalUrl)
       "${u.scheme}://${u.host}"
     }.getOrDefault(source.baseUrl)
+
+    val candidateSource = source.copy(
+      baseUrl = base,
+      searchUrlTemplate = if (source.sourceType != SourceType.RSS_ATOM) resolved else source.searchUrlTemplate,
+      feedUrl = if (source.sourceType == SourceType.RSS_ATOM) resolved else source.feedUrl
+    )
+    val parsed = when (candidateSource.sourceType) {
+      SourceType.RSS_ATOM -> adapter.parseRssOrAtom(candidateSource, probe.body.orEmpty(), "", 1, probe.finalUrl)
+      SourceType.JSON_API -> adapter.parseJsonApi(candidateSource, probe.body.orEmpty(), "", 1, probe.finalUrl)
+      SourceType.HTML_SELECTOR -> adapter.parseHtmlWithSelectors(candidateSource, probe.body.orEmpty(), probe.finalUrl, "", 1)
+    }
+
+    val verified = parsed.parseError == null && parsed.items.isNotEmpty()
+    val hostLabel = runCatching { URI(probe.finalUrl).host }.getOrNull() ?: base
     return VerifiedReplacement(
-      label = label,
+      label = if (verified) "Verified $label" else "Suggested $label",
       replacementBaseUrl = base,
       replacementSearchTemplate = if (source.sourceType != SourceType.RSS_ATOM) resolved else null,
       replacementFeedUrl = if (source.sourceType == SourceType.RSS_ATOM) resolved else null,
       detectedSourceType = source.sourceType,
-      verificationSummary = "Verified HTTP ${probe.statusCode} response from ${URI(probe.finalUrl).host}."
+      verificationSummary = if (verified) {
+        "Verified HTTP ${probe.statusCode} from $hostLabel — parsed ${parsed.items.size} items."
+      } else {
+        "Redirect target $hostLabel responded HTTP ${probe.statusCode}, but parser reported: ${parsed.parseError ?: "0 items extracted"}."
+      },
+      isVerified = verified,
+      reason = if (verified) {
+        "Fetched redirect target and confirmed item extraction."
+      } else {
+        "Endpoint returned HTTP ${probe.statusCode}, but item extraction was not verified."
+      }
     )
   }
 

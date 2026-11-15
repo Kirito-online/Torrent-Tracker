@@ -85,6 +85,7 @@ data class TorrentSource(
   val sourceType: SourceType,
   val enabled: Boolean = true,
   val isBuiltIn: Boolean = false,
+  val allowCleartextHttp: Boolean = false,
   val htmlSelectors: HtmlSelectorConfig = HtmlSelectorConfig(),
   val jsonMapping: JsonMappingConfig = JsonMappingConfig(),
   val lastSuccessAt: Long? = null,
@@ -109,6 +110,31 @@ data class TorrentSource(
 
   val isHttps: Boolean
     get() = baseUrl.trim().lowercase().startsWith("https://")
+
+  val usesCleartextHttp: Boolean
+    get() = baseUrl.trim().lowercase().startsWith("http://") ||
+      searchUrlTemplate.trim().lowercase().startsWith("http://") ||
+      feedUrl.trim().lowercase().startsWith("http://")
+}
+
+@Serializable
+data class TorrentSourceOffer(
+  val sourceId: String,
+  val sourceName: String,
+  val sourceUrl: String? = null,
+  val magnetLink: String? = null,
+  val torrentFileUrl: String? = null,
+  val seeders: Int? = null,
+  val leechers: Int? = null,
+  val fileSizeText: String? = null,
+  val fileSizeBytes: Long? = null,
+  val uploadDateText: String? = null,
+  val uploadTimestamp: Long? = null,
+  val uploader: String? = null,
+  val isSourceHealthy: Boolean = true
+) {
+  val hasMagnet: Boolean get() = !magnetLink.isNullOrBlank()
+  val hasDirectTorrent: Boolean get() = !torrentFileUrl.isNullOrBlank()
 }
 
 data class TorrentItem(
@@ -141,7 +167,8 @@ data class TorrentItem(
   val description: String? = null,
   val isFavorite: Boolean = false,
   val collectionId: String? = null,
-  val relevanceScore: Int = 0
+  val relevanceScore: Int = 0,
+  val availableSources: List<TorrentSourceOffer> = emptyList()
 ) {
   val hasMagnet: Boolean get() = !magnetLink.isNullOrBlank()
   val hasDirectTorrent: Boolean get() = !torrentFileUrl.isNullOrBlank()
@@ -151,6 +178,28 @@ data class TorrentItem(
       season != null -> "S%02d".format(season)
       else -> null
     }
+
+  fun toPrimaryOffer(isSourceHealthy: Boolean = true): TorrentSourceOffer = TorrentSourceOffer(
+    sourceId = sourceId,
+    sourceName = sourceName,
+    sourceUrl = sourceUrl,
+    magnetLink = magnetLink,
+    torrentFileUrl = torrentFileUrl,
+    seeders = seeders,
+    leechers = leechers,
+    fileSizeText = fileSizeText,
+    fileSizeBytes = fileSizeBytes,
+    uploadDateText = uploadDateText,
+    uploadTimestamp = uploadTimestamp,
+    uploader = uploader,
+    isSourceHealthy = isSourceHealthy
+  )
+
+  val allSourceOffers: List<TorrentSourceOffer>
+    get() = availableSources.ifEmpty { listOf(toPrimaryOffer()) }
+
+  val sourceCount: Int
+    get() = allSourceOffers.size.coerceAtLeast(1)
 }
 
 enum class SortOption(val label: String) {
@@ -275,7 +324,9 @@ data class VerifiedReplacement(
   val replacementFeedUrl: String?,
   val detectedSourceType: SourceType?,
   val replacementHtmlSelectors: HtmlSelectorConfig? = null,
-  val verificationSummary: String
+  val verificationSummary: String,
+  val isVerified: Boolean = true,
+  val reason: String = ""
 )
 
 data class SourceDiagnosticReport(

@@ -82,7 +82,13 @@ fun CloudflareVerificationScreen(
           Column {
             Text("Open Verification", style = MaterialTheme.typography.titleMedium)
             Row(verticalAlignment = Alignment.CenterVertically) {
-              Icon(Icons.Filled.Lock, null, tint = SeederGreen, modifier = Modifier.size(12.dp))
+              val isHttps = currentUrl.startsWith("https://", ignoreCase = true)
+              Icon(
+                Icons.Filled.Lock,
+                contentDescription = if (isHttps) "HTTPS encrypted" else "Unencrypted HTTP",
+                tint = if (isHttps) SeederGreen else MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(12.dp)
+              )
               Spacer(Modifier.width(4.dp))
               Text(
                 currentUrl,
@@ -122,7 +128,7 @@ fun CloudflareVerificationScreen(
           .padding(horizontal = 12.dp, vertical = 10.dp)
       ) {
         Text(
-          text = "Isolated verification session: complete any browser check manually, then tap Retry Source. If automated requests remain blocked, open in your external browser.",
+          text = "Manual browser verification: complete any challenge here so this domain's temporary session cookie can be reused by search requests until it expires. No cookies are logged or exported. If verification keeps failing, open the site in your external browser.",
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -180,7 +186,7 @@ fun CloudflareVerificationScreen(
             settings.userAgentString = TorrentHttpClient.DEFAULT_USER_AGENT
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(this, true)
+            cm.setAcceptThirdPartyCookies(this, true) // Required by Turnstile/challenge iframes within WebView session
 
             webChromeClient = object : WebChromeClient() {
               override fun onProgressChanged(view: WebView?, newProgress: Int) {

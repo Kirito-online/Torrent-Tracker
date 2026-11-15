@@ -13,6 +13,7 @@ data class TorrentSourceEntity(
   val sourceType: String,
   val enabled: Boolean,
   val isBuiltIn: Boolean,
+  val allowCleartextHttp: Boolean = false,
   val htmlSelectorsJson: String,
   val jsonMappingJson: String,
   val lastSuccessAt: Long?,
@@ -55,7 +56,8 @@ data class FavoriteTorrentEntity(
   val subtitles: String?,
   val tagsJson: String,
   val description: String?,
-  val savedAt: Long
+  val savedAt: Long,
+  val alternateSourcesJson: String = "[]"
 )
 
 @Entity(tableName = "favorite_collections")
@@ -105,5 +107,6 @@ data class CachedTorrentEntity(
   val subtitles: String?,
   val tagsJson: String,
   val description: String?,
-  val cachedAt: Long
+  val cachedAt: Long,
+  val alternateSourcesJson: String = "[]"
 )

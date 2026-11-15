@@ -32,6 +32,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -61,6 +62,7 @@ import com.example.domain.model.FavoriteCollection
 import com.example.domain.model.TorrentItem
 import com.example.ui.components.CategoryFallbackIcon
 import com.example.ui.components.CompactLabelBadge
+import com.example.ui.components.SourceAlternativesBottomSheet
 import com.example.ui.components.TorrentIntents
 import com.example.ui.theme.LeecherAmber
 import com.example.ui.theme.SeederGreen
@@ -142,6 +144,10 @@ fun TorrentDetailContent(
 ) {
   val context = LocalContext.current
   var showCollectionDialog by remember { mutableStateOf(false) }
+  var showAllSourcesSheet by remember { mutableStateOf(false) }
+  var selectedOffer by remember(item.id, item.availableSources) {
+    mutableStateOf(item.allSourceOffers.first())
+  }
 
   Column(
     modifier = modifier
@@ -224,19 +230,22 @@ fun TorrentDetailContent(
         Spacer(Modifier.height(10.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-          item.seeders?.let { s ->
+          val activeSeeders = selectedOffer.seeders ?: item.seeders
+          val activeLeechers = selectedOffer.leechers ?: item.leechers
+          val activeSize = selectedOffer.fileSizeText ?: item.fileSizeText
+          activeSeeders?.let { s ->
             Column {
               Text("SEEDERS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
               Text(s.toString(), style = MaterialTheme.typography.titleMedium, color = SeederGreen)
             }
           }
-          item.leechers?.let { l ->
+          activeLeechers?.let { l ->
             Column {
               Text("LEECHERS", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
               Text(l.toString(), style = MaterialTheme.typography.titleMedium, color = LeecherAmber)
             }
           }
-          item.fileSizeText?.let { sz ->
+          activeSize?.let { sz ->
             Column {
               Text("SIZE", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
               Text(sz, style = MaterialTheme.typography.titleMedium)
@@ -248,15 +257,18 @@ fun TorrentDetailContent(
 
     Spacer(Modifier.height(16.dp))
 
-    // Primary Torrent Actions
-    val primaryLink = item.magnetLink ?: item.torrentFileUrl
+    // Primary Torrent Actions (targets currently selected source offer)
+    val activeMagnet = selectedOffer.magnetLink ?: item.magnetLink
+    val activeTorrentUrl = selectedOffer.torrentFileUrl ?: item.torrentFileUrl
+    val activeSourceUrl = selectedOffer.sourceUrl ?: item.sourceUrl
+    val primaryLink = activeMagnet ?: activeTorrentUrl
     Row(
       modifier = Modifier.fillMaxWidth(),
       horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
       Button(
         onClick = {
-          TorrentIntents.openMagnetLink(context, item.magnetLink, item.torrentFileUrl, onFeedback)
+          TorrentIntents.openMagnetLink(context, activeMagnet, activeTorrentUrl, onFeedback)
         },
         enabled = primaryLink != null,
         modifier = Modifier
@@ -266,7 +278,7 @@ fun TorrentDetailContent(
       ) {
         Icon(Icons.Filled.Link, null, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(6.dp))
-        Text(if (item.hasMagnet) "Open Magnet" else "Open .Torrent")
+        Text(if (!activeMagnet.isNullOrBlank()) "Open Magnet" else "Open .Torrent")
       }
 
       FilledTonalButton(
@@ -292,7 +304,7 @@ fun TorrentDetailContent(
     ) {
       OutlinedButton(
         onClick = {
-          TorrentIntents.shareMagnetOrLink(context, item.title, item.magnetLink ?: item.torrentFileUrl, item.sourceUrl)
+          TorrentIntents.shareMagnetOrLink(context, item.title, primaryLink, activeSourceUrl)
         },
         modifier = Modifier
           .weight(1f)
@@ -305,8 +317,8 @@ fun TorrentDetailContent(
       }
 
       OutlinedButton(
-        onClick = { TorrentIntents.openExternalUrl(context, item.sourceUrl, onFeedback) },
-        enabled = !item.sourceUrl.isNullOrBlank(),
+        onClick = { TorrentIntents.openExternalUrl(context, activeSourceUrl, onFeedback) },
+        enabled = !activeSourceUrl.isNullOrBlank(),
         modifier = Modifier
           .weight(1f)
           .height(48.dp)
@@ -315,6 +327,43 @@ fun TorrentDetailContent(
         Icon(Icons.Filled.OpenInBrowser, null, modifier = Modifier.size(17.dp))
         Spacer(Modifier.width(6.dp))
         Text("Source Page")
+      }
+    }
+
+    if (item.sourceCount > 1) {
+      Spacer(Modifier.height(12.dp))
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Text("Available Sources (${item.sourceCount})", style = MaterialTheme.typography.titleSmall)
+        TextButton(
+          onClick = { showAllSourcesSheet = true },
+          modifier = Modifier.testTag("detail_compare_sources_button")
+        ) {
+          Text("Compare All")
+        }
+      }
+      FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+      ) {
+        item.allSourceOffers.forEachIndexed { idx, offer ->
+          val isChosen = offer == selectedOffer
+          val seedLabel = offer.seeders?.let { " · ↑$it" }.orEmpty()
+          FilterChip(
+            selected = isChosen,
+            onClick = { selectedOffer = offer },
+            label = {
+              Text(
+                "${offer.sourceName}$seedLabel${if (idx == 0) " ★" else ""}",
+                style = MaterialTheme.typography.labelSmall
+              )
+            },
+            modifier = Modifier.testTag("detail_source_chip_${offer.sourceId}")
+          )
+        }
       }
     }
 
@@ -340,15 +389,15 @@ fun TorrentDetailContent(
     Spacer(Modifier.height(8.dp))
 
     val rows = buildList {
-      add("Source" to item.sourceName)
+      add("Source" to selectedOffer.sourceName)
       item.videoQuality?.let { add("Video Quality" to it) }
       item.encoding?.let { add("Encoding" to it) }
       item.language?.let { add("Language" to it) }
       item.subtitles?.let { add("Subtitles" to it) }
-      item.uploadDateText?.let { add("Uploaded" to it) }
-      item.uploader?.let { add("Uploader" to it) }
+      (selectedOffer.uploadDateText ?: item.uploadDateText)?.let { add("Uploaded" to it) }
+      (selectedOffer.uploader ?: item.uploader)?.let { add("Uploader" to it) }
       item.infoHash?.let { add("Info Hash" to it) }
-      item.sourceUrl?.let { add("Source URL" to it) }
+      activeSourceUrl?.let { add("Source URL" to it) }
     }
 
     Column(
@@ -414,6 +463,15 @@ fun TorrentDetailContent(
     }
 
     Spacer(Modifier.height(24.dp))
+  }
+
+  if (showAllSourcesSheet) {
+    SourceAlternativesBottomSheet(
+      item = item,
+      onSelectAsPrimary = { offer -> selectedOffer = offer },
+      onFeedback = onFeedback,
+      onDismiss = { showAllSourcesSheet = false }
+    )
   }
 
   if (showCollectionDialog) {

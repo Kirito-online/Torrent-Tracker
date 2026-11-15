@@ -375,7 +375,8 @@ fun HomeSearchScreen(
                     onClick = {
                       if (isWideScreen) onSelectDetailInPane(item) else onOpenDetail(item)
                     },
-                    onToggleFavorite = { onToggleFavorite(item) }
+                    onToggleFavorite = { onToggleFavorite(item) },
+                    onFeedback = onFeedback
                   )
                 }
 

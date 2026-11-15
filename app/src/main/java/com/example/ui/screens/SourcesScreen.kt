@@ -713,6 +713,20 @@ private fun SourceRowItem(
       horizontalArrangement = Arrangement.spacedBy(6.dp),
       verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
+      val healthLabel = when (source.health) {
+        SourceHealth.ONLINE -> "Online"
+        SourceHealth.CLOUDFLARE_REQUIRED -> "Verify CF"
+        SourceHealth.PARSE_ERROR -> "Parse Error"
+        SourceHealth.REDIRECTED -> "Redirected"
+        SourceHealth.OFFLINE -> "Offline"
+        SourceHealth.DISABLED -> "Disabled"
+        SourceHealth.UNKNOWN -> "Untested"
+      }
+      CompactLabelBadge(
+        text = healthLabel,
+        containerColor = statusColor.copy(alpha = 0.16f),
+        contentColor = statusColor
+      )
       CompactLabelBadge(
         text = source.sourceType.label,
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
@@ -836,14 +850,13 @@ internal fun SourceEditorSheet(
   var sourceType by remember(initialSource) { mutableStateOf(initialSource.sourceType) }
   var htmlCfg by remember(initialSource) { mutableStateOf(initialSource.htmlSelectors) }
   var jsonCfg by remember(initialSource) { mutableStateOf(initialSource.jsonMapping) }
-  var acknowledgedHttpRisk by remember(initialSource) { mutableStateOf(false) }
+  var acknowledgedHttpRisk by remember(initialSource) { mutableStateOf(initialSource.allowCleartextHttp) }
   var showHttpConfirmDialog by remember { mutableStateOf(false) }
 
-  val isHttpWarning = preferHttps && (
-    baseUrl.trim().startsWith("http://", true) ||
-      searchTemplate.trim().startsWith("http://", true) ||
-      feedUrl.trim().startsWith("http://", true)
-    )
+  val hasHttpUrl = baseUrl.trim().startsWith("http://", true) ||
+    searchTemplate.trim().startsWith("http://", true) ||
+    feedUrl.trim().startsWith("http://", true)
+  val isHttpWarning = preferHttps && hasHttpUrl
 
   fun buildDraft(): TorrentSource = initialSource.copy(
     name = name.trim().ifBlank { "Custom Source" },
@@ -851,6 +864,7 @@ internal fun SourceEditorSheet(
     searchUrlTemplate = searchTemplate.trim(),
     feedUrl = feedUrl.trim(),
     sourceType = sourceType,
+    allowCleartextHttp = hasHttpUrl && (acknowledgedHttpRisk || !preferHttps),
     htmlSelectors = htmlCfg,
     jsonMapping = jsonCfg
   )

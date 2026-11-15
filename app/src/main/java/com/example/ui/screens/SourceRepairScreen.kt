@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -38,6 +39,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
@@ -54,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import com.example.domain.model.SourceType
 import com.example.domain.model.TorrentSource
 import com.example.domain.model.VerifiedReplacement
+import com.example.ui.components.CompactLabelBadge
 import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.SeederGreen
 import com.example.ui.theme.WarningOrange
@@ -89,6 +92,7 @@ fun SourceRepairScreen(
     )
   }
   var showEditSheet by remember { mutableStateOf(false) }
+  var pendingManualHttpUrl by remember { mutableStateOf<String?>(null) }
 
   Scaffold(
     topBar = {
@@ -243,50 +247,38 @@ fun SourceRepairScreen(
         }
 
         if (report.verifiedReplacements.isNotEmpty()) {
-          Spacer(Modifier.height(14.dp))
-          Text("Verified Fixes & Replacements", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
-          Spacer(Modifier.height(6.dp))
-          report.verifiedReplacements.forEach { replacement ->
-            val candidateUrl = replacement.replacementFeedUrl
-              ?: replacement.replacementSearchTemplate
-              ?: replacement.replacementBaseUrl
-            val candidateSource = source.copy(
-              baseUrl = replacement.replacementBaseUrl.ifBlank { source.baseUrl },
-              searchUrlTemplate = replacement.replacementSearchTemplate ?: source.searchUrlTemplate,
-              feedUrl = replacement.replacementFeedUrl ?: source.feedUrl,
-              sourceType = replacement.detectedSourceType ?: source.sourceType,
-              htmlSelectors = replacement.replacementHtmlSelectors ?: source.htmlSelectors
-            )
-            Column(
-              modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 4.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(10.dp)
-            ) {
-              Text(replacement.label, style = MaterialTheme.typography.titleSmall)
-              val subtitleText = replacement.replacementHtmlSelectors?.let { cfg ->
-                "Container: ${cfg.itemContainer}"
-              } ?: candidateUrl
-              Text(
-                subtitleText,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
+          val verifiedFixes = report.verifiedReplacements.filter { it.isVerified }
+          val suggestedCandidates = report.verifiedReplacements.filter { !it.isVerified }
+
+          if (verifiedFixes.isNotEmpty()) {
+            Spacer(Modifier.height(14.dp))
+            Text("Verified Fixes", style = MaterialTheme.typography.titleSmall, color = SeederGreen)
+            Spacer(Modifier.height(6.dp))
+            verifiedFixes.forEach { replacement ->
+              ReplacementCandidateCard(
+                source = source,
+                replacement = replacement,
+                onTestCandidateUrl = onTestCandidateUrl,
+                onApplyReplacement = onApplyReplacement
               )
-              Spacer(Modifier.height(4.dp))
-              Text(replacement.verificationSummary, style = MaterialTheme.typography.bodySmall)
-              Spacer(Modifier.height(8.dp))
-              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                  onClick = { onTestCandidateUrl(candidateUrl, candidateSource) }
-                ) {
-                  Text(if (replacement.replacementHtmlSelectors != null) "Test Selectors" else "Test URL")
-                }
-                Button(onClick = { onApplyReplacement(source.id, replacement) }) {
-                  Text("Apply Fix")
-                }
-              }
+            }
+          }
+
+          if (suggestedCandidates.isNotEmpty()) {
+            Spacer(Modifier.height(14.dp))
+            Text(
+              "Suggested Candidates (Unverified — Test Before Applying)",
+              style = MaterialTheme.typography.titleSmall,
+              color = WarningOrange
+            )
+            Spacer(Modifier.height(6.dp))
+            suggestedCandidates.forEach { replacement ->
+              ReplacementCandidateCard(
+                source = source,
+                replacement = replacement,
+                onTestCandidateUrl = onTestCandidateUrl,
+                onApplyReplacement = onApplyReplacement
+              )
             }
           }
         }
@@ -319,11 +311,17 @@ fun SourceRepairScreen(
         }
         Button(
           onClick = {
-            val updated = when (source.sourceType) {
-              SourceType.RSS_ATOM -> source.copy(feedUrl = manualUrl.trim())
-              else -> source.copy(searchUrlTemplate = manualUrl.trim())
+            val trimmed = manualUrl.trim()
+            if (trimmed.startsWith("http://", true) && preferHttps && !source.allowCleartextHttp) {
+              pendingManualHttpUrl = trimmed
+            } else {
+              val isHttp = trimmed.startsWith("http://", true)
+              val updated = when (source.sourceType) {
+                SourceType.RSS_ATOM -> source.copy(feedUrl = trimmed, allowCleartextHttp = isHttp)
+                else -> source.copy(searchUrlTemplate = trimmed, allowCleartextHttp = isHttp)
+              }
+              onSaveSource(updated)
             }
-            onSaveSource(updated)
           },
           enabled = manualUrl.startsWith("http://", true) || manualUrl.startsWith("https://", true),
           modifier = Modifier.weight(1f)
@@ -366,5 +364,105 @@ fun SourceRepairScreen(
       },
       onDismiss = { showEditSheet = false }
     )
+  }
+
+  pendingManualHttpUrl?.let { httpUrl ->
+    if (source != null) {
+      AlertDialog(
+        onDismissRequest = { pendingManualHttpUrl = null },
+        title = { Text("Allow Insecure HTTP?") },
+        text = {
+          Text("'$httpUrl' uses unencrypted HTTP. Confirm only if you trust this endpoint.")
+        },
+        confirmButton = {
+          TextButton(onClick = {
+            val updated = when (source.sourceType) {
+              SourceType.RSS_ATOM -> source.copy(feedUrl = httpUrl, allowCleartextHttp = true)
+              else -> source.copy(searchUrlTemplate = httpUrl, allowCleartextHttp = true)
+            }
+            onSaveSource(updated)
+            pendingManualHttpUrl = null
+          }) { Text("Apply HTTP") }
+        },
+        dismissButton = {
+          TextButton(onClick = { pendingManualHttpUrl = null }) { Text("Cancel") }
+        }
+      )
+    }
+  }
+}
+
+@Composable
+private fun ReplacementCandidateCard(
+  source: TorrentSource,
+  replacement: VerifiedReplacement,
+  onTestCandidateUrl: (String, TorrentSource) -> Unit,
+  onApplyReplacement: (String, VerifiedReplacement) -> Unit
+) {
+  val candidateUrl = replacement.replacementFeedUrl
+    ?: replacement.replacementSearchTemplate
+    ?: replacement.replacementBaseUrl
+  val candidateSource = source.copy(
+    baseUrl = replacement.replacementBaseUrl.ifBlank { source.baseUrl },
+    searchUrlTemplate = replacement.replacementSearchTemplate ?: source.searchUrlTemplate,
+    feedUrl = replacement.replacementFeedUrl ?: source.feedUrl,
+    sourceType = replacement.detectedSourceType ?: source.sourceType,
+    htmlSelectors = replacement.replacementHtmlSelectors ?: source.htmlSelectors,
+    allowCleartextHttp = candidateUrl.startsWith("http://", true) || source.allowCleartextHttp
+  )
+  Column(
+    modifier = Modifier
+      .fillMaxWidth()
+      .padding(vertical = 4.dp)
+      .clip(RoundedCornerShape(8.dp))
+      .background(MaterialTheme.colorScheme.surfaceVariant)
+      .padding(10.dp)
+  ) {
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Text(
+        replacement.label,
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.weight(1f).padding(end = 8.dp)
+      )
+      CompactLabelBadge(
+        text = if (replacement.isVerified) "Verified" else "Unverified",
+        containerColor = (if (replacement.isVerified) SeederGreen else WarningOrange).copy(alpha = 0.16f),
+        contentColor = if (replacement.isVerified) SeederGreen else WarningOrange
+      )
+    }
+    Spacer(Modifier.height(2.dp))
+    val subtitleText = replacement.replacementHtmlSelectors?.let { cfg ->
+      "Container: ${cfg.itemContainer}"
+    } ?: candidateUrl
+    Text(
+      subtitleText,
+      style = MaterialTheme.typography.labelSmall,
+      color = MaterialTheme.colorScheme.primary
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(replacement.verificationSummary, style = MaterialTheme.typography.bodySmall)
+    if (replacement.reason.isNotBlank()) {
+      Spacer(Modifier.height(2.dp))
+      Text(
+        replacement.reason,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+      )
+    }
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      OutlinedButton(
+        onClick = { onTestCandidateUrl(candidateUrl, candidateSource) }
+      ) {
+        Text(if (replacement.replacementHtmlSelectors != null) "Test Selectors" else "Test URL")
+      }
+      Button(onClick = { onApplyReplacement(source.id, replacement) }) {
+        Text(if (replacement.isVerified) "Apply Fix" else "Apply Anyway")
+      }
+    }
   }
 }

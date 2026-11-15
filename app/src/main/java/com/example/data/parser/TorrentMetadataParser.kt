@@ -193,7 +193,7 @@ object TorrentMetadataParser {
   }
 
   fun computeDedupeKey(infoHash: String?, sourceUrl: String?, title: String): String {
-    if (!infoHash.isNullOrBlank()) return "btih:${infoHash.lowercase()}"
+    if (!infoHash.isNullOrBlank()) return "btih:${infoHash.trim().lowercase()}"
     val normalizedTitle = title.lowercase()
       .replace(Regex("[^a-z0-9]"), "")
       .take(80)
@@ -203,6 +203,46 @@ object TorrentMetadataParser {
       .joinToString("") { "%02x".format(it) }
       .take(24)
     return "hash:$digest"
+  }
+
+  private val releaseNoiseRegex = Regex(
+    """\b(bluray|blu-ray|bdrip|brrip|web-dl|webdl|webrip|hdtv|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|dts|10bit|subbed|multi|repack|proper)\b""",
+    RegexOption.IGNORE_CASE
+  )
+
+  /**
+   * Computes a conservative grouping key for multi-source aggregation.
+   * - Verified infoHashes always group strictly by exact lowercase BTIH (never merges differing hashes).
+   * - When infoHash is absent, uses normalized title tokens plus releaseYear, season, episode, and resolution.
+   *   Callers must also verify file size compatibility via [areFallbackSizesCompatible] before merging.
+   */
+  fun computeConservativeGroupKey(item: com.example.domain.model.TorrentItem): String {
+    if (!item.infoHash.isNullOrBlank()) {
+      return "btih:${item.infoHash.trim().lowercase()}"
+    }
+    val cleanedTitle = releaseNoiseRegex.replace(item.title.lowercase(), " ")
+      .replace(Regex("[^a-z0-9]+"), " ")
+      .trim()
+      .split(Regex("\\s+"))
+      .filter { it.isNotBlank() }
+      .joinToString("")
+      .take(72)
+      .ifBlank { computeDedupeKey(null, item.sourceUrl, item.title) }
+
+    val yearPart = item.releaseYear?.toString() ?: ""
+    val seasonPart = item.season?.toString() ?: ""
+    val episodePart = item.episode?.toString() ?: ""
+    val resPart = item.resolution?.lowercase()?.trim() ?: ""
+    return "meta:$cleanedTitle|y:$yearPart|s:$seasonPart|e:$episodePart|r:$resPart"
+  }
+
+  fun areFallbackSizesCompatible(sizeA: Long?, sizeB: Long?): Boolean {
+    if (sizeA == null && sizeB == null) return true
+    if (sizeA == null || sizeB == null) return false
+    if (sizeA <= 0L || sizeB <= 0L) return sizeA == sizeB
+    val max = maxOf(sizeA, sizeB).toDouble()
+    val diff = kotlin.math.abs(sizeA - sizeB).toDouble()
+    return (diff / max) <= 0.12
   }
 
   fun computeRelevanceScore(title: String, query: String, seeders: Int?): Int {

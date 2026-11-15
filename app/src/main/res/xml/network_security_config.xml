@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+      User-configured custom torrent sources may point to arbitrary domains, including
+      legacy plain-HTTP hosts explicitly confirmed by the user. TorrentHttpClient enforces
+      HTTPS-by-default and requires per-source user confirmation before allowing HTTP.
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

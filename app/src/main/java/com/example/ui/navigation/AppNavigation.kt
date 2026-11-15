@@ -88,6 +88,8 @@ fun AppNavigation(
   val storageUsage by settingsViewModel.storageUsage.collectAsStateWithLifecycle()
   val diagnosticsResults by settingsViewModel.diagnosticsResults.collectAsStateWithLifecycle()
   val isRunningBulkDiag by settingsViewModel.isRunningBulkDiagnostics.collectAsStateWithLifecycle()
+  val pendingImportBackup by settingsViewModel.pendingImportBackup.collectAsStateWithLifecycle()
+  val isProcessingBackup by settingsViewModel.isProcessingBackup.collectAsStateWithLifecycle()
   val settingsFeedback by settingsViewModel.feedbackMessage.collectAsStateWithLifecycle()
 
   val backStackEntry by navController.currentBackStackEntryAsState()
@@ -267,7 +269,8 @@ fun AppNavigation(
                 onOpenDetail = { item ->
                   searchViewModel.selectTorrent(item)
                   navController.navigate(DetailRoute(item.id))
-                }
+                },
+                onFeedback = ::showToast
               )
             }
 
@@ -350,6 +353,8 @@ fun AppNavigation(
                 storageUsage = storageUsage,
                 diagnosticsResults = diagnosticsResults,
                 isRunningDiagnostics = isRunningBulkDiag,
+                pendingImportBackup = pendingImportBackup,
+                isProcessingBackup = isProcessingBackup,
                 onBack = { navController.popBackStack() },
                 onRefreshStorageStats = settingsViewModel::refreshStorageStats,
                 onThemeChanged = settingsViewModel::setThemeMode,
@@ -367,6 +372,11 @@ fun AppNavigation(
                 onClearImageCache = settingsViewModel::clearImageCache,
                 onClearSearchHistory = settingsViewModel::clearSearchHistory,
                 onClearTempCache = settingsViewModel::clearTemporaryCache,
+                onBuildBackupJson = settingsViewModel::buildBackupJson,
+                onLoadImportJson = settingsViewModel::loadBackupForPreview,
+                onConfirmRestoreBackup = settingsViewModel::confirmRestoreBackup,
+                onDismissImportPreview = settingsViewModel::dismissImportPreview,
+                onBackupFeedback = settingsViewModel::notifyFeedback,
                 onOpenAbout = { navController.navigate(AboutRoute) }
               )
             }

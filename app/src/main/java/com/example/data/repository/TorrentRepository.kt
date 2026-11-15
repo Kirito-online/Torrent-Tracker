@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import android.content.Context
+import androidx.room.withTransaction
 import coil.ImageLoader
 import com.example.data.local.db.AppDatabase
 import com.example.data.local.db.CachedTorrentEntity
@@ -9,25 +10,38 @@ import com.example.data.local.db.FavoriteCollectionEntity
 import com.example.data.local.db.FavoriteTorrentEntity
 import com.example.data.local.db.SearchHistoryEntity
 import com.example.data.local.db.TorrentSourceEntity
+import com.example.data.local.prefs.PreferencesRepository
 import com.example.data.network.TorrentHttpClient
 import com.example.data.parser.DetectedFeed
 import com.example.data.parser.DiscoveredSourceCandidate
 import com.example.data.parser.SourceRepairEngine
 import com.example.data.parser.TorrentMetadataParser
 import com.example.data.parser.UnifiedSourceAdapter
+import com.example.domain.model.BackupCollectionEntry
+import com.example.domain.model.BackupFavoriteEntry
+import com.example.domain.model.BackupPreferencesEntry
+import com.example.domain.model.BackupRestoreSummary
+import com.example.domain.model.BackupSearchHistoryEntry
+import com.example.domain.model.BackupSelection
+import com.example.domain.model.BackupSourceEntry
 import com.example.domain.model.FavoriteCollection
 import com.example.domain.model.HtmlSelectorConfig
 import com.example.domain.model.JsonMappingConfig
+import com.example.domain.model.RestoreMode
 import com.example.domain.model.SearchFilterState
 import com.example.domain.model.SearchHistoryItem
 import com.example.domain.model.SortOption
 import com.example.domain.model.SourceDiagnosticReport
+import com.example.domain.model.SourceHealth
 import com.example.domain.model.SourceProgressState
 import com.example.domain.model.SourceType
 import com.example.domain.model.StorageUsageInfo
 import com.example.domain.model.TorrentCategory
 import com.example.domain.model.TorrentItem
 import com.example.domain.model.TorrentSource
+import com.example.domain.model.TorrentSourceOffer
+import com.example.domain.model.TorrentTrackerBackup
+import com.example.domain.model.UserPreferences
 import com.example.domain.model.VerifiedReplacement
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -45,6 +59,12 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.UUID
 
+data class SourcePageRequest(
+  val sourceId: String,
+  val page: Int,
+  val overrideUrl: String? = null
+)
+
 sealed interface ProgressiveSearchEvent {
   data class SourceStarted(val sourceId: String, val sourceName: String) : ProgressiveSearchEvent
   data class SourceCompleted(
@@ -52,6 +72,8 @@ sealed interface ProgressiveSearchEvent {
     val sourceName: String,
     val items: List<TorrentItem>,
     val hasMore: Boolean,
+    val nextPageUrl: String? = null,
+    val requestUrl: String = "",
     val progress: SourceProgressState
   ) : ProgressiveSearchEvent
   data class CachedFallbackLoaded(val items: List<TorrentItem>) : ProgressiveSearchEvent
@@ -71,7 +93,11 @@ class TorrentRepository(
   val adapter = UnifiedSourceAdapter(httpClient)
   val repairEngine = SourceRepairEngine(httpClient, adapter)
 
-  private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+  private val json = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+    prettyPrint = true
+  }
 
   suspend fun ensureSeeded() = withContext(Dispatchers.IO) {
     DefaultSourcesSeeder.seedIfEmpty(sourceDao)
@@ -131,39 +157,58 @@ class TorrentRepository(
       adapter.discoverSourceFromUrl(input, timeoutSeconds)
     }
 
-  suspend fun testSingleSource(source: TorrentSource, timeoutSeconds: Int): SourceProgressState =
-    withContext(Dispatchers.IO) {
-      val start = System.currentTimeMillis()
-      val res = adapter.fetchPage(source, "ubuntu", 1, timeoutSeconds)
-      val duration = System.currentTimeMillis() - start
-      val now = System.currentTimeMillis()
-      val redirectUrl = res.redirectChain.firstOrNull()?.substringAfter("-> ")?.trim()
+  suspend fun testSingleSource(
+    source: TorrentSource,
+    timeoutSeconds: Int,
+    preferHttps: Boolean = true,
+    forceNetwork: Boolean = false
+  ): SourceProgressState = withContext(Dispatchers.IO) {
+    val start = System.currentTimeMillis()
+    val allowCleartext = !preferHttps || source.allowCleartextHttp
+    val res = adapter.fetchPage(
+      source = source,
+      query = "ubuntu",
+      page = 1,
+      timeoutSeconds = timeoutSeconds,
+      forceNetwork = forceNetwork,
+      allowCleartext = allowCleartext
+    )
+    val duration = System.currentTimeMillis() - start
+    val now = System.currentTimeMillis()
+    val redirectUrl = res.redirectChain.firstOrNull()?.substringAfter("-> ")?.trim()
 
-      val updated = source.copy(
-        lastCheckedAt = now,
-        lastSuccessAt = if (res.errorMessage == null) now else source.lastSuccessAt,
-        lastError = res.errorMessage,
-        lastStatusCode = res.statusCode,
-        lastRedirectUrl = redirectUrl ?: if (res.errorMessage == null) null else source.lastRedirectUrl,
-        requiresCloudflare = res.isCloudflareChallenge
+    val updated = source.copy(
+      lastCheckedAt = now,
+      lastSuccessAt = if (res.errorMessage == null) now else source.lastSuccessAt,
+      lastError = res.errorMessage,
+      lastStatusCode = res.statusCode,
+      lastRedirectUrl = redirectUrl ?: if (res.errorMessage == null) null else source.lastRedirectUrl,
+      requiresCloudflare = res.isCloudflareChallenge
+    )
+    sourceDao.upsert(updated.toEntity())
+
+    if (res.errorMessage == null) {
+      SourceProgressState.Success(res.items.size, duration)
+    } else {
+      SourceProgressState.Error(
+        message = res.errorMessage,
+        statusCode = res.statusCode,
+        isCloudflare = res.isCloudflareChallenge,
+        redirectUrl = redirectUrl
       )
-      sourceDao.upsert(updated.toEntity())
-
-      if (res.errorMessage == null) {
-        SourceProgressState.Success(res.items.size, duration)
-      } else {
-        SourceProgressState.Error(
-          message = res.errorMessage,
-          statusCode = res.statusCode,
-          isCloudflare = res.isCloudflareChallenge,
-          redirectUrl = redirectUrl
-        )
-      }
     }
+  }
 
   suspend fun testSelectorsPreview(source: TorrentSource, query: String, timeoutSeconds: Int): Pair<String, List<TorrentItem>> =
     withContext(Dispatchers.IO) {
-      val res = adapter.fetchPage(source, query, 1, timeoutSeconds)
+      val res = adapter.fetchPage(
+        source = source,
+        query = query,
+        page = 1,
+        timeoutSeconds = timeoutSeconds,
+        forceNetwork = true,
+        allowCleartext = true
+      )
       val msg = if (res.errorMessage != null) {
         "Error: ${res.errorMessage}"
       } else {
@@ -187,12 +232,19 @@ class TorrentRepository(
     withContext(Dispatchers.IO) {
       val current = sourceDao.getById(sourceId)?.toDomain() ?: return@withContext false
       val snapshot = json.encodeToString(current.copy(previousWorkingConfigJson = null))
+      val nextBase = replacement.replacementBaseUrl
+      val nextSearch = replacement.replacementSearchTemplate ?: current.searchUrlTemplate
+      val nextFeed = replacement.replacementFeedUrl ?: current.feedUrl
+      val usesHttp = nextBase.startsWith("http://", true) ||
+        nextSearch.startsWith("http://", true) ||
+        nextFeed.startsWith("http://", true)
       val updated = current.copy(
-        baseUrl = replacement.replacementBaseUrl,
-        searchUrlTemplate = replacement.replacementSearchTemplate ?: current.searchUrlTemplate,
-        feedUrl = replacement.replacementFeedUrl ?: current.feedUrl,
+        baseUrl = nextBase,
+        searchUrlTemplate = nextSearch,
+        feedUrl = nextFeed,
         sourceType = replacement.detectedSourceType ?: current.sourceType,
         htmlSelectors = replacement.replacementHtmlSelectors ?: current.htmlSelectors,
+        allowCleartextHttp = if (usesHttp) current.allowCleartextHttp else false,
         lastError = null,
         lastRedirectUrl = null,
         requiresCloudflare = false,
@@ -202,9 +254,13 @@ class TorrentRepository(
       true
     }
 
-  suspend fun markCloudflareVerifiedCheck(sourceId: String, timeoutSeconds: Int): SourceProgressState {
+  suspend fun markCloudflareVerifiedCheck(
+    sourceId: String,
+    timeoutSeconds: Int,
+    preferHttps: Boolean = true
+  ): SourceProgressState {
     val source = getSourceById(sourceId) ?: return SourceProgressState.Error("Source not found")
-    return testSingleSource(source, timeoutSeconds)
+    return testSingleSource(source, timeoutSeconds, preferHttps = preferHttps, forceNetwork = true)
   }
 
   // --- Multi-source Progressive Search & Refresh ---
@@ -214,17 +270,23 @@ class TorrentRepository(
     page: Int,
     timeoutSeconds: Int,
     maxConcurrency: Int,
-    specificSourceId: String? = null
+    specificSourceId: String? = null,
+    preferHttps: Boolean = true,
+    forceNetwork: Boolean = false,
+    pageRequests: Map<String, SourcePageRequest> = emptyMap()
   ): Flow<ProgressiveSearchEvent> = channelFlow {
     ensureSeeded()
-    val favoriteIds = favoriteDao.getFavoriteById("__dummy__") // ensure DB ready
     val enabledSources = withContext(Dispatchers.IO) {
       val all = sourceDao.getEnabled().map { it.toDomain() }
-      if (specificSourceId != null) all.filter { it.id == specificSourceId } else all
+      when {
+        specificSourceId != null -> all.filter { it.id == specificSourceId }
+        pageRequests.isNotEmpty() -> all.filter { pageRequests.containsKey(it.id) }
+        else -> all
+      }
     }
 
     val cacheKey = "${query.trim().lowercase()}_p$page"
-    if (page == 1 && specificSourceId == null) {
+    if (page == 1 && specificSourceId == null && pageRequests.isEmpty()) {
       val cached = withContext(Dispatchers.IO) { cacheDao.getByQueryKey(cacheKey) }
       if (cached.isNotEmpty()) {
         send(ProgressiveSearchEvent.CachedFallbackLoaded(cached.map { it.toDomain() }))
@@ -236,9 +298,21 @@ class TorrentRepository(
       enabledSources.forEach { source ->
         launch(Dispatchers.IO) {
           semaphore.withPermit {
+            val req = pageRequests[source.id]
+            val targetPage = req?.page ?: page
+            val allowCleartext = !preferHttps || source.allowCleartextHttp
+
             send(ProgressiveSearchEvent.SourceStarted(source.id, source.name))
             val start = System.currentTimeMillis()
-            val result = adapter.fetchPage(source, query, page, timeoutSeconds)
+            val result = adapter.fetchPage(
+              source = source,
+              query = query,
+              page = targetPage,
+              timeoutSeconds = timeoutSeconds,
+              overrideUrl = req?.overrideUrl,
+              forceNetwork = forceNetwork,
+              allowCleartext = allowCleartext
+            )
             val duration = System.currentTimeMillis() - start
             val now = System.currentTimeMillis()
             val redirectUrl = result.redirectChain.firstOrNull()?.substringAfter("-> ")?.trim()
@@ -253,9 +327,8 @@ class TorrentRepository(
             ).toEntity()
             sourceDao.upsert(updatedEntity)
 
-            if (result.items.isNotEmpty() && specificSourceId == null) {
+            if (result.items.isNotEmpty() && specificSourceId == null && targetPage == 1) {
               cacheDao.insertAll(result.items.map { it.toCacheEntity(cacheKey, now) })
-              // Keep cache bounded
               cacheDao.pruneOlderThan(now - 7L * 24 * 60 * 60 * 1000)
             }
 
@@ -276,6 +349,8 @@ class TorrentRepository(
                 sourceName = source.name,
                 items = result.items,
                 hasMore = result.hasNextPage,
+                nextPageUrl = result.nextPageUrl,
+                requestUrl = result.requestUrl,
                 progress = progress
               )
             )
@@ -285,34 +360,70 @@ class TorrentRepository(
     }
   }
 
-  suspend fun runAllSourcesDiagnostic(timeoutSeconds: Int): List<Pair<TorrentSource, SourceProgressState>> =
+  suspend fun runAllSourcesDiagnostic(
+    timeoutSeconds: Int,
+    maxConcurrency: Int = 4,
+    preferHttps: Boolean = true
+  ): List<Pair<TorrentSource, SourceProgressState>> =
     withContext(Dispatchers.IO) {
       val all = sourceDao.getAll().map { it.toDomain() }.filter { it.enabled }
+      val semaphore = Semaphore(maxConcurrency.coerceIn(1, 8))
       coroutineScope {
         all.map { source ->
-          async { source to testSingleSource(source, timeoutSeconds) }
+          async {
+            semaphore.withPermit {
+              source to testSingleSource(source, timeoutSeconds, preferHttps = preferHttps, forceNetwork = true)
+            }
+          }
         }.awaitAll()
       }
     }
 
+  /**
+   * Groups matching torrents across sources while strictly avoiding false merges:
+   * - Verified infoHashes group strictly by lowercase infoHash (never merges differing infoHashes).
+   * - Hashless entries group conservatively by normalized title + year + season + episode + resolution + compatible size.
+   * All matching source offers remain attached on [TorrentItem.availableSources] and the best recommended
+   * source is promoted to primary fields.
+   */
   fun deduplicateAndFilter(
     items: List<TorrentItem>,
     favoriteIds: Set<String>,
-    filter: SearchFilterState
+    filter: SearchFilterState,
+    sourceHealthMap: Map<String, SourceHealth> = emptyMap()
   ): List<TorrentItem> {
-    // Deduplicate by infoHash / normalized key, keeping highest-seeder or richer entry
-    val dedupedMap = LinkedHashMap<String, TorrentItem>()
+    val buckets = LinkedHashMap<String, MutableList<TorrentItem>>()
     for (item in items) {
-      val key = TorrentMetadataParser.computeDedupeKey(item.infoHash, item.sourceUrl, item.title)
-      val enriched = item.copy(isFavorite = favoriteIds.contains(item.id))
-      val existing = dedupedMap[key]
-      if (existing == null || (enriched.seeders ?: -1) > (existing.seeders ?: -1)) {
-        dedupedMap[key] = enriched
+      val baseKey = TorrentMetadataParser.computeConservativeGroupKey(item)
+      if (!item.infoHash.isNullOrBlank()) {
+        buckets.getOrPut(baseKey) { mutableListOf() }.add(item)
+      } else {
+        var matchedKey: String? = null
+        var suffix = 0
+        while (true) {
+          val candidateKey = if (suffix == 0) baseKey else "$baseKey#$suffix"
+          val existingList = buckets[candidateKey]
+          if (existingList == null) {
+            matchedKey = candidateKey
+            break
+          }
+          val rep = existingList.first()
+          if (TorrentMetadataParser.areFallbackSizesCompatible(rep.fileSizeBytes, item.fileSizeBytes)) {
+            matchedKey = candidateKey
+            break
+          }
+          suffix++
+        }
+        buckets.getOrPut(matchedKey!!) { mutableListOf() }.add(item)
       }
     }
 
+    val groupedItems = buckets.values.map { group ->
+      mergeGroupedItems(group, favoriteIds, sourceHealthMap)
+    }
+
     val now = System.currentTimeMillis()
-    val filtered = dedupedMap.values.filter { item ->
+    val filtered = groupedItems.filter { item ->
       val catMatch = filter.selectedCategories.isEmpty() ||
         filter.selectedCategories.contains(TorrentCategory.ALL) ||
         filter.selectedCategories.contains(item.category)
@@ -345,7 +456,7 @@ class TorrentRepository(
       } ?: true
 
       val sourceMatch = filter.selectedSourceIds.isEmpty() ||
-        filter.selectedSourceIds.contains(item.sourceId)
+        item.allSourceOffers.any { filter.selectedSourceIds.contains(it.sourceId) }
 
       catMatch && resMatch && seedMatch && leechMatch && sizeMatch && langMatch && subMatch && dateMatch && sourceMatch
     }
@@ -360,6 +471,90 @@ class TorrentRepository(
       SortOption.LARGEST -> filtered.sortedByDescending { it.fileSizeBytes ?: -1L }
       SortOption.SMALLEST -> filtered.sortedBy { it.fileSizeBytes ?: Long.MAX_VALUE }
     }
+  }
+
+  private fun mergeGroupedItems(
+    group: List<TorrentItem>,
+    favoriteIds: Set<String>,
+    sourceHealthMap: Map<String, SourceHealth>
+  ): TorrentItem {
+    val rawOffers = group.flatMap { item ->
+      item.allSourceOffers.map { offer ->
+        val health = sourceHealthMap[offer.sourceId]
+        val isHealthy = if (health == null) {
+          offer.isSourceHealthy
+        } else {
+          health == SourceHealth.ONLINE || health == SourceHealth.UNKNOWN
+        }
+        offer.copy(isSourceHealthy = isHealthy)
+      }
+    }
+
+    // Deduplicate identical offers from the same source, keeping the richer/higher-seeded one
+    val dedupOffers = LinkedHashMap<String, TorrentSourceOffer>()
+    for (offer in rawOffers) {
+      val offerKey = "${offer.sourceId}|${offer.sourceUrl.orEmpty()}|${offer.magnetLink.orEmpty()}|${offer.torrentFileUrl.orEmpty()}"
+      val existing = dedupOffers[offerKey]
+      if (existing == null || scoreOffer(offer) > scoreOffer(existing)) {
+        dedupOffers[offerKey] = offer
+      }
+    }
+
+    val sortedOffers = dedupOffers.values.sortedByDescending { scoreOffer(it) }
+    val primaryOffer = sortedOffers.first()
+    val primaryItem = group.firstOrNull { it.sourceId == primaryOffer.sourceId } ?: group.first()
+
+    val isFav = group.any { favoriteIds.contains(it.id) }
+    val mergedCollectionId = group.firstNotNullOfOrNull { it.collectionId }
+    val canonicalId = if (isFav) {
+      group.firstOrNull { favoriteIds.contains(it.id) }?.id ?: primaryItem.id
+    } else {
+      primaryItem.id
+    }
+
+    return primaryItem.copy(
+      id = canonicalId,
+      sourceId = primaryOffer.sourceId,
+      sourceName = primaryOffer.sourceName,
+      sourceUrl = primaryOffer.sourceUrl ?: primaryItem.sourceUrl,
+      magnetLink = primaryOffer.magnetLink ?: primaryItem.magnetLink,
+      torrentFileUrl = primaryOffer.torrentFileUrl ?: primaryItem.torrentFileUrl,
+      seeders = primaryOffer.seeders ?: primaryItem.seeders,
+      leechers = primaryOffer.leechers ?: primaryItem.leechers,
+      fileSizeText = primaryOffer.fileSizeText ?: primaryItem.fileSizeText,
+      fileSizeBytes = primaryOffer.fileSizeBytes ?: primaryItem.fileSizeBytes,
+      uploadDateText = primaryOffer.uploadDateText ?: primaryItem.uploadDateText,
+      uploadTimestamp = primaryOffer.uploadTimestamp ?: primaryItem.uploadTimestamp,
+      uploader = primaryOffer.uploader ?: primaryItem.uploader,
+      coverImageUrl = primaryItem.coverImageUrl ?: group.firstNotNullOfOrNull { it.coverImageUrl },
+      description = primaryItem.description ?: group.firstNotNullOfOrNull { it.description },
+      language = primaryItem.language ?: group.firstNotNullOfOrNull { it.language },
+      subtitles = primaryItem.subtitles ?: group.firstNotNullOfOrNull { it.subtitles },
+      releaseYear = primaryItem.releaseYear ?: group.firstNotNullOfOrNull { it.releaseYear },
+      season = primaryItem.season ?: group.firstNotNullOfOrNull { it.season },
+      episode = primaryItem.episode ?: group.firstNotNullOfOrNull { it.episode },
+      resolution = primaryItem.resolution ?: group.firstNotNullOfOrNull { it.resolution },
+      videoQuality = primaryItem.videoQuality ?: group.firstNotNullOfOrNull { it.videoQuality },
+      encoding = primaryItem.encoding ?: group.firstNotNullOfOrNull { it.encoding },
+      tags = group.flatMap { it.tags }.distinct().take(8),
+      relevanceScore = group.maxOf { it.relevanceScore },
+      isFavorite = isFav,
+      collectionId = mergedCollectionId,
+      availableSources = sortedOffers
+    )
+  }
+
+  private fun scoreOffer(offer: TorrentSourceOffer): Int {
+    var score = 0
+    if (offer.isSourceHealthy) score += 5_000
+    if (offer.hasMagnet) score += 1_500
+    if (offer.hasDirectTorrent) score += 700
+    if (!offer.sourceUrl.isNullOrBlank()) score += 200
+    score += ((offer.seeders ?: 0).coerceAtLeast(0).coerceAtMost(20_000)) * 2
+    if (offer.fileSizeBytes != null && offer.fileSizeBytes > 0) score += 150
+    if (offer.uploadTimestamp != null) score += 80
+    if (!offer.uploader.isNullOrBlank()) score += 40
+    return score
   }
 
   // --- Favorites & Custom Collections ---
@@ -443,6 +638,308 @@ class TorrentRepository(
     historyDao.clearAll()
   }
 
+  // --- Backup & Restore (Portable Versioned JSON, Zero Cookies/Secrets) ---
+
+  suspend fun exportBackupJson(
+    selection: BackupSelection,
+    preferences: UserPreferences,
+    appVersion: String = ""
+  ): String = withContext(Dispatchers.IO) {
+    val sources = if (selection.includeSources) {
+      sourceDao.getAll().map { entity ->
+        val domain = entity.toDomain()
+        BackupSourceEntry(
+          id = domain.id,
+          name = domain.name,
+          baseUrl = domain.baseUrl,
+          searchUrlTemplate = domain.searchUrlTemplate,
+          feedUrl = domain.feedUrl,
+          sourceType = domain.sourceType,
+          enabled = domain.enabled,
+          isBuiltIn = domain.isBuiltIn,
+          allowCleartextHttp = domain.allowCleartextHttp,
+          htmlSelectors = domain.htmlSelectors,
+          jsonMapping = domain.jsonMapping,
+          createdAt = domain.createdAt
+        )
+      }
+    } else emptyList()
+
+    val collections = if (selection.includeFavoritesAndCollections) {
+      favoriteDao.getAllCollectionsOnce().map { col ->
+        BackupCollectionEntry(
+          id = col.id,
+          name = col.name,
+          createdAt = col.createdAt,
+          isSystem = col.isSystem
+        )
+      }
+    } else emptyList()
+
+    val favorites = if (selection.includeFavoritesAndCollections) {
+      favoriteDao.getAllFavoritesOnce().map { fav ->
+        val domain = fav.toDomain()
+        BackupFavoriteEntry(
+          id = fav.id,
+          title = fav.title,
+          category = domain.category,
+          collectionId = fav.collectionId,
+          releaseYear = fav.releaseYear,
+          season = fav.season,
+          episode = fav.episode,
+          resolution = fav.resolution,
+          videoQuality = fav.videoQuality,
+          encoding = fav.encoding,
+          fileSizeText = fav.fileSizeText,
+          fileSizeBytes = fav.fileSizeBytes,
+          seeders = fav.seeders,
+          leechers = fav.leechers,
+          uploadDateText = fav.uploadDateText,
+          uploadTimestamp = fav.uploadTimestamp,
+          uploader = fav.uploader,
+          sourceId = fav.sourceId,
+          sourceName = fav.sourceName,
+          sourceUrl = fav.sourceUrl,
+          magnetLink = fav.magnetLink,
+          torrentFileUrl = fav.torrentFileUrl,
+          infoHash = fav.infoHash,
+          coverImageUrl = fav.coverImageUrl,
+          language = fav.language,
+          subtitles = fav.subtitles,
+          tags = domain.tags,
+          description = fav.description,
+          savedAt = fav.savedAt,
+          availableSources = domain.availableSources
+        )
+      }
+    } else emptyList()
+
+    val prefsEntry = if (selection.includePreferences) {
+      BackupPreferencesEntry(
+        themeMode = preferences.themeMode,
+        accentColor = preferences.accentColor,
+        displayDensity = preferences.displayDensity,
+        defaultCategory = preferences.defaultCategory,
+        defaultSort = preferences.defaultSort,
+        searchDebounceMs = preferences.searchDebounceMs,
+        autoRefreshOnLaunch = preferences.autoRefreshOnLaunch,
+        sourceTimeoutSeconds = preferences.sourceTimeoutSeconds,
+        maxConcurrentSources = preferences.maxConcurrentSources,
+        preferHttps = preferences.preferHttps
+      )
+    } else null
+
+    val history = if (selection.includeSearchHistory) {
+      historyDao.getAllHistoryOnce().map { h ->
+        BackupSearchHistoryEntry(
+          query = h.query,
+          timestamp = h.timestamp,
+          resultCount = h.resultCount,
+          categoryLabel = h.categoryLabel
+        )
+      }
+    } else emptyList()
+
+    val backup = TorrentTrackerBackup(
+      schemaVersion = TorrentTrackerBackup.CURRENT_SCHEMA_VERSION,
+      exportedAt = System.currentTimeMillis(),
+      appVersion = appVersion,
+      sources = sources,
+      favorites = favorites,
+      collections = collections,
+      preferences = prefsEntry,
+      searchHistory = history
+    )
+    json.encodeToString(backup)
+  }
+
+  fun parseAndValidateBackup(rawJson: String): Result<TorrentTrackerBackup> {
+    if (rawJson.isBlank()) {
+      return Result.failure(IllegalArgumentException("Backup file is empty."))
+    }
+    return runCatching {
+      val parsed = json.decodeFromString<TorrentTrackerBackup>(rawJson)
+      require(parsed.schemaVersion in 1..TorrentTrackerBackup.CURRENT_SCHEMA_VERSION) {
+        "Unsupported backup schema version (${parsed.schemaVersion}). Please update Torrent Tracker."
+      }
+      parsed.sources.forEach { src ->
+        require(src.id.isNotBlank() && src.name.isNotBlank()) {
+          "Backup contains a source with missing ID or name."
+        }
+        val baseLower = src.baseUrl.trim().lowercase()
+        require(baseLower.startsWith("https://") || baseLower.startsWith("http://")) {
+          "Source '${src.name}' has an invalid base URL."
+        }
+      }
+      parsed.favorites.forEach { fav ->
+        require(fav.id.isNotBlank() && fav.title.isNotBlank()) {
+          "Backup contains an invalid favorite entry."
+        }
+      }
+      parsed
+    }
+  }
+
+  suspend fun restoreBackup(
+    backup: TorrentTrackerBackup,
+    selection: BackupSelection,
+    mode: RestoreMode,
+    preferencesRepository: PreferencesRepository? = null
+  ): BackupRestoreSummary = withContext(Dispatchers.IO) {
+    var sourcesRestored = 0
+    var favoritesRestored = 0
+    var collectionsRestored = 0
+    var historyRestored = 0
+
+    database.withTransaction {
+      if (selection.includeSources) {
+        val mappedSources = backup.sources.map { src ->
+          TorrentSource(
+            id = src.id,
+            name = src.name,
+            baseUrl = src.baseUrl,
+            searchUrlTemplate = src.searchUrlTemplate,
+            feedUrl = src.feedUrl,
+            sourceType = src.sourceType,
+            enabled = src.enabled,
+            isBuiltIn = src.isBuiltIn,
+            allowCleartextHttp = src.allowCleartextHttp,
+            htmlSelectors = src.htmlSelectors,
+            jsonMapping = src.jsonMapping,
+            createdAt = src.createdAt
+          ).toEntity()
+        }
+        if (mode == RestoreMode.REPLACE) {
+          sourceDao.deleteAll()
+          if (mappedSources.isNotEmpty()) {
+            sourceDao.upsertAll(mappedSources)
+            sourcesRestored = mappedSources.size
+          }
+        } else {
+          val existingIds = sourceDao.getAll().map { it.id }.toSet()
+          val toInsert = mappedSources.filterNot { existingIds.contains(it.id) }
+          if (toInsert.isNotEmpty()) {
+            sourceDao.upsertAll(toInsert)
+          }
+          sourcesRestored = toInsert.size
+        }
+      }
+
+      if (selection.includeFavoritesAndCollections) {
+        val mappedCollections = backup.collections.map { col ->
+          FavoriteCollectionEntity(
+            id = col.id,
+            name = col.name,
+            createdAt = col.createdAt,
+            isSystem = col.isSystem
+          )
+        }
+        val mappedFavorites = backup.favorites.map { fav ->
+          FavoriteTorrentEntity(
+            id = fav.id,
+            title = fav.title,
+            category = fav.category.name,
+            collectionId = fav.collectionId,
+            releaseYear = fav.releaseYear,
+            season = fav.season,
+            episode = fav.episode,
+            resolution = fav.resolution,
+            videoQuality = fav.videoQuality,
+            encoding = fav.encoding,
+            fileSizeText = fav.fileSizeText,
+            fileSizeBytes = fav.fileSizeBytes,
+            seeders = fav.seeders,
+            leechers = fav.leechers,
+            uploadDateText = fav.uploadDateText,
+            uploadTimestamp = fav.uploadTimestamp,
+            uploader = fav.uploader,
+            sourceId = fav.sourceId,
+            sourceName = fav.sourceName,
+            sourceUrl = fav.sourceUrl,
+            magnetLink = fav.magnetLink,
+            torrentFileUrl = fav.torrentFileUrl,
+            infoHash = fav.infoHash,
+            coverImageUrl = fav.coverImageUrl,
+            language = fav.language,
+            subtitles = fav.subtitles,
+            tagsJson = json.encodeToString(fav.tags),
+            description = fav.description,
+            savedAt = fav.savedAt,
+            alternateSourcesJson = json.encodeToString(fav.availableSources)
+          )
+        }
+
+        if (mode == RestoreMode.REPLACE) {
+          favoriteDao.deleteAllFavorites()
+          favoriteDao.deleteAllCollections()
+          if (mappedCollections.isNotEmpty()) {
+            favoriteDao.upsertCollections(mappedCollections)
+            collectionsRestored = mappedCollections.size
+          }
+          if (mappedFavorites.isNotEmpty()) {
+            favoriteDao.upsertFavorites(mappedFavorites)
+            favoritesRestored = mappedFavorites.size
+          }
+        } else {
+          val existingColIds = favoriteDao.getAllCollectionsOnce().map { it.id }.toSet()
+          val colsToInsert = mappedCollections.filterNot { existingColIds.contains(it.id) }
+          if (colsToInsert.isNotEmpty()) {
+            favoriteDao.upsertCollections(colsToInsert)
+          }
+          collectionsRestored = colsToInsert.size
+
+          val existingFavIds = favoriteDao.getAllFavoritesOnce().map { it.id }.toSet()
+          val favsToInsert = mappedFavorites.filterNot { existingFavIds.contains(it.id) }
+          if (favsToInsert.isNotEmpty()) {
+            favoriteDao.upsertFavorites(favsToInsert)
+          }
+          favoritesRestored = favsToInsert.size
+        }
+      }
+
+      if (selection.includeSearchHistory) {
+        val mappedHistory = backup.searchHistory
+          .filter { it.query.isNotBlank() }
+          .map { h ->
+            SearchHistoryEntity(
+              query = h.query.trim(),
+              timestamp = h.timestamp,
+              resultCount = h.resultCount,
+              categoryLabel = h.categoryLabel
+            )
+          }
+        if (mode == RestoreMode.REPLACE) {
+          historyDao.clearAll()
+          if (mappedHistory.isNotEmpty()) {
+            historyDao.insertAll(mappedHistory)
+            historyRestored = mappedHistory.size
+          }
+        } else {
+          val existingQueries = historyDao.getAllHistoryOnce().map { it.query.trim().lowercase() }.toSet()
+          val toInsert = mappedHistory.filterNot { existingQueries.contains(it.query.lowercase()) }
+          if (toInsert.isNotEmpty()) {
+            historyDao.insertAll(toInsert)
+          }
+          historyRestored = toInsert.size
+        }
+      }
+    }
+
+    var prefsRestored = false
+    if (selection.includePreferences && backup.preferences != null && preferencesRepository != null) {
+      preferencesRepository.applyBackupPreferences(backup.preferences)
+      prefsRestored = true
+    }
+
+    BackupRestoreSummary(
+      sourcesRestored = sourcesRestored,
+      favoritesRestored = favoritesRestored,
+      collectionsRestored = collectionsRestored,
+      historyRestored = historyRestored,
+      preferencesRestored = prefsRestored
+    )
+  }
+
   // --- Storage & Cache Management ---
 
   suspend fun getStorageUsage(): StorageUsageInfo = withContext(Dispatchers.IO) {
@@ -491,6 +988,7 @@ class TorrentRepository(
     sourceType = runCatching { SourceType.valueOf(sourceType) }.getOrDefault(SourceType.RSS_ATOM),
     enabled = enabled,
     isBuiltIn = isBuiltIn,
+    allowCleartextHttp = allowCleartextHttp,
     htmlSelectors = runCatching { json.decodeFromString<HtmlSelectorConfig>(htmlSelectorsJson) }
       .getOrDefault(HtmlSelectorConfig()),
     jsonMapping = runCatching { json.decodeFromString<JsonMappingConfig>(jsonMappingJson) }
@@ -514,6 +1012,7 @@ class TorrentRepository(
     sourceType = sourceType.name,
     enabled = enabled,
     isBuiltIn = isBuiltIn,
+    allowCleartextHttp = allowCleartextHttp,
     htmlSelectorsJson = json.encodeToString(htmlSelectors),
     jsonMappingJson = json.encodeToString(jsonMapping),
     lastSuccessAt = lastSuccessAt,
@@ -555,7 +1054,9 @@ class TorrentRepository(
     tags = runCatching { json.decodeFromString<List<String>>(tagsJson) }.getOrDefault(emptyList()),
     description = description,
     isFavorite = true,
-    collectionId = collectionId
+    collectionId = collectionId,
+    availableSources = runCatching { json.decodeFromString<List<TorrentSourceOffer>>(alternateSourcesJson) }
+      .getOrDefault(emptyList())
   )
 
   private fun TorrentItem.toFavoriteEntity(savedAt: Long): FavoriteTorrentEntity = FavoriteTorrentEntity(
@@ -587,7 +1088,8 @@ class TorrentRepository(
     subtitles = subtitles,
     tagsJson = json.encodeToString(tags),
     description = description,
-    savedAt = savedAt
+    savedAt = savedAt,
+    alternateSourcesJson = json.encodeToString(allSourceOffers)
   )
 
   private fun CachedTorrentEntity.toDomain(): TorrentItem = TorrentItem(
@@ -617,7 +1119,9 @@ class TorrentRepository(
     language = language,
     subtitles = subtitles,
     tags = runCatching { json.decodeFromString<List<String>>(tagsJson) }.getOrDefault(emptyList()),
-    description = description
+    description = description,
+    availableSources = runCatching { json.decodeFromString<List<TorrentSourceOffer>>(alternateSourcesJson) }
+      .getOrDefault(emptyList())
   )
 
   private fun TorrentItem.toCacheEntity(queryKey: String, cachedAt: Long): CachedTorrentEntity = CachedTorrentEntity(
@@ -649,7 +1153,8 @@ class TorrentRepository(
     subtitles = subtitles,
     tagsJson = json.encodeToString(tags),
     description = description,
-    cachedAt = cachedAt
+    cachedAt = cachedAt,
+    alternateSourcesJson = json.encodeToString(allSourceOffers)
   )
 
   private fun FavoriteCollectionEntity.toDomain(): FavoriteCollection = FavoriteCollection(

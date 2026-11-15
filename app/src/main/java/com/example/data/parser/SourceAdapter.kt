@@ -39,13 +39,18 @@ interface SourceAdapter {
     source: TorrentSource,
     query: String,
     page: Int,
-    timeoutSeconds: Int
+    timeoutSeconds: Int,
+    overrideUrl: String? = null,
+    forceNetwork: Boolean = false,
+    allowCleartext: Boolean = true
   ): AdapterFetchResult
 }
 
 data class AdapterFetchResult(
   val items: List<TorrentItem>,
   val hasNextPage: Boolean,
+  val nextPageUrl: String? = null,
+  val requestUrl: String = "",
   val statusCode: Int?,
   val finalUrl: String?,
   val redirectChain: List<String>,
@@ -57,13 +62,20 @@ class UnifiedSourceAdapter(
   private val httpClient: TorrentHttpClient
 ) : SourceAdapter {
 
+  companion object {
+    const val MAX_PAGINATION_PAGES = 20
+  }
+
   override suspend fun fetchPage(
     source: TorrentSource,
     query: String,
     page: Int,
-    timeoutSeconds: Int
+    timeoutSeconds: Int,
+    overrideUrl: String?,
+    forceNetwork: Boolean,
+    allowCleartext: Boolean
   ): AdapterFetchResult {
-    val targetUrl = buildRequestUrl(source, query, page)
+    val targetUrl = overrideUrl?.takeIf { it.isNotBlank() } ?: buildRequestUrl(source, query, page)
     val accept = when (source.sourceType) {
       SourceType.RSS_ATOM -> "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
       SourceType.JSON_API -> "application/json, text/plain, */*"
@@ -74,13 +86,17 @@ class UnifiedSourceAdapter(
       url = targetUrl,
       timeoutSeconds = timeoutSeconds,
       followRedirects = true,
-      acceptHeader = accept
+      acceptHeader = accept,
+      forceNetwork = forceNetwork,
+      allowCleartext = allowCleartext
     )
 
     if (!response.isSuccessful || response.body == null) {
       return AdapterFetchResult(
         items = emptyList(),
         hasNextPage = false,
+        nextPageUrl = null,
+        requestUrl = targetUrl,
         statusCode = response.statusCode,
         finalUrl = response.finalUrl,
         redirectChain = response.redirectChain,
@@ -90,14 +106,16 @@ class UnifiedSourceAdapter(
     }
 
     val outcome = when (source.sourceType) {
-      SourceType.RSS_ATOM -> parseRssOrAtom(source, response.body, query)
-      SourceType.JSON_API -> parseJsonApi(source, response.body, query, page)
-      SourceType.HTML_SELECTOR -> parseHtmlWithSelectors(source, response.body, response.finalUrl, query)
+      SourceType.RSS_ATOM -> parseRssOrAtom(source, response.body, query, page, response.finalUrl.ifBlank { targetUrl })
+      SourceType.JSON_API -> parseJsonApi(source, response.body, query, page, response.finalUrl.ifBlank { targetUrl })
+      SourceType.HTML_SELECTOR -> parseHtmlWithSelectors(source, response.body, response.finalUrl, query, page)
     }
 
     return AdapterFetchResult(
       items = outcome.items,
       hasNextPage = outcome.hasNextPage,
+      nextPageUrl = outcome.nextPageUrl,
+      requestUrl = targetUrl,
       statusCode = response.statusCode,
       finalUrl = response.finalUrl,
       redirectChain = response.redirectChain,
@@ -122,8 +140,24 @@ class UnifiedSourceAdapter(
       .replace("{page}", page.toString())
   }
 
-  fun parseRssOrAtom(source: TorrentSource, xml: String, query: String): SourceParseOutcome {
+  private fun activeTemplateUsesPage(source: TorrentSource, query: String): Boolean {
+    val template = if (query.trim().isBlank() && source.feedUrl.isNotBlank()) {
+      source.feedUrl
+    } else {
+      source.searchUrlTemplate.ifBlank { source.feedUrl }
+    }
+    return template.contains("{page}", ignoreCase = false)
+  }
+
+  fun parseRssOrAtom(
+    source: TorrentSource,
+    xml: String,
+    query: String,
+    page: Int = 1,
+    requestUrl: String = ""
+  ): SourceParseOutcome {
     val items = mutableListOf<TorrentItem>()
+    var feedNextUrl: String? = null
     try {
       val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = false }
       val parser = factory.newPullParser()
@@ -162,6 +196,15 @@ class UnifiedSourceAdapter(
               title = ""; link = ""; guid = ""; description = ""; pubDate = ""
               author = ""; categoryRaw = ""; magnet = ""; torrentUrl = ""
               imageUrl = ""; sizeRaw = ""; seedersRaw = ""; leechersRaw = ""; infoHashRaw = ""
+            } else if (!inItem && !inEntry && (tagName == "atom:link" || tagName == "link")) {
+              val rel = parser.getAttributeValue(null, "rel").orEmpty()
+              val href = parser.getAttributeValue(null, "href").orEmpty()
+              if (rel.equals("next", ignoreCase = true) && href.isNotBlank() && feedNextUrl == null) {
+                val resolved = resolveUrl(requestUrl.ifBlank { source.baseUrl }, href)
+                if (!resolved.isNullOrBlank() && resolved != requestUrl) {
+                  feedNextUrl = resolved
+                }
+              }
             } else if (inItem || inEntry) {
               when {
                 tagName == "enclosure" -> {
@@ -326,7 +369,13 @@ class UnifiedSourceAdapter(
         )
       }
 
-      return SourceParseOutcome(items = items, hasNextPage = false)
+      val hasNext = !feedNextUrl.isNullOrBlank() ||
+        (items.isNotEmpty() && activeTemplateUsesPage(source, query) && page < MAX_PAGINATION_PAGES)
+      return SourceParseOutcome(
+        items = items,
+        hasNextPage = hasNext,
+        nextPageUrl = feedNextUrl
+      )
     } catch (e: Exception) {
       return SourceParseOutcome(
         items = emptyList(),
@@ -344,7 +393,13 @@ class UnifiedSourceAdapter(
     }
   }
 
-  fun parseJsonApi(source: TorrentSource, rawJson: String, query: String, page: Int): SourceParseOutcome {
+  fun parseJsonApi(
+    source: TorrentSource,
+    rawJson: String,
+    query: String,
+    page: Int,
+    requestUrl: String = ""
+  ): SourceParseOutcome {
     val trimmed = rawJson.trim()
     if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
       return SourceParseOutcome(
@@ -356,10 +411,12 @@ class UnifiedSourceAdapter(
 
     return try {
       val cfg = source.jsonMapping
+      var rootObj: JSONObject? = null
       val array: JSONArray = if (trimmed.startsWith("[")) {
         JSONArray(trimmed)
       } else {
         val root = JSONObject(trimmed)
+        rootObj = root
         extractJsonArray(root, cfg.itemsPath)
           ?: extractJsonArray(root, "results")
           ?: extractJsonArray(root, "torrents")
@@ -526,8 +583,12 @@ class UnifiedSourceAdapter(
         )
       }
 
-      val hasMore = items.size >= 15 && page < 10
-      SourceParseOutcome(items = items, hasNextPage = hasMore)
+      val pagination = extractJsonPagination(rootObj, source, query, page, items.size, requestUrl)
+      SourceParseOutcome(
+        items = items,
+        hasNextPage = pagination.first,
+        nextPageUrl = pagination.second
+      )
     } catch (e: Exception) {
       SourceParseOutcome(
         items = emptyList(),
@@ -537,11 +598,76 @@ class UnifiedSourceAdapter(
     }
   }
 
+  private fun extractJsonPagination(
+    root: JSONObject?,
+    source: TorrentSource,
+    query: String,
+    currentPage: Int,
+    itemCount: Int,
+    requestUrl: String
+  ): Pair<Boolean, String?> {
+    if (itemCount == 0 || currentPage >= MAX_PAGINATION_PAGES) return false to null
+
+    if (root != null) {
+      // 1. Direct next-page URL keys
+      val urlCandidates = listOf("next", "next_page_url", "nextPageUrl", "pagination.next", "pagination.next_url", "links.next", "meta.next")
+      for (key in urlCandidates) {
+        val raw = readJsonString(root, key)
+        if (!raw.isNullOrBlank() && raw != "null" && raw != "false") {
+          if (raw.startsWith("http://", true) || raw.startsWith("https://", true) || raw.startsWith("/")) {
+            val resolved = resolveUrl(requestUrl.ifBlank { source.baseUrl }, raw)
+            if (!resolved.isNullOrBlank() && resolved != requestUrl) {
+              return true to resolved
+            }
+          }
+        }
+      }
+
+      // 2. Explicit boolean continuation flags
+      val boolCandidates = listOf("has_more", "hasMore", "has_next", "hasNext", "pagination.has_next", "pagination.hasMore", "meta.has_more")
+      for (key in boolCandidates) {
+        val raw = resolveJsonValue(root, key)
+        if (raw is Boolean) {
+          return (raw && activeTemplateUsesPage(source, query)) to null
+        }
+      }
+
+      // 3. Explicit next_page / total_pages integer metadata
+      val nextPageInt = listOf("next_page", "nextPage", "pagination.next_page")
+        .firstNotNullOfOrNull { readJsonInt(root, it) }
+      if (nextPageInt != null) {
+        return (nextPageInt > currentPage && activeTemplateUsesPage(source, query)) to null
+      }
+
+      val totalPages = listOf("total_pages", "totalPages", "page_count", "pagination.total_pages", "meta.total_pages")
+        .firstNotNullOfOrNull { readJsonInt(root, it) }
+      if (totalPages != null) {
+        return (currentPage < totalPages && activeTemplateUsesPage(source, query)) to null
+      }
+
+      // 4. YTS / offset-limit count metadata (data.movie_count, data.limit, data.page_number)
+      val totalCount = readJsonInt(root, "data.movie_count")
+        ?: readJsonInt(root, "total_count")
+        ?: readJsonInt(root, "totalResults")
+        ?: readJsonInt(root, "total")
+      val limit = readJsonInt(root, "data.limit") ?: readJsonInt(root, "limit") ?: readJsonInt(root, "per_page")
+      val reportedPage = readJsonInt(root, "data.page_number") ?: readJsonInt(root, "page") ?: currentPage
+      if (totalCount != null && limit != null && limit > 0) {
+        val hasMore = (reportedPage * limit) < totalCount && activeTemplateUsesPage(source, query)
+        return hasMore to null
+      }
+    }
+
+    // Fallback when API omits pagination metadata: only paginate if active template explicitly accepts {page}
+    return activeTemplateUsesPage(source, query) to null
+  }
+
   fun parseHtmlWithSelectors(
     source: TorrentSource,
     html: String,
     finalUrl: String,
-    query: String
+    query: String,
+    page: Int = 1
   ): SourceParseOutcome {
     return try {
       val doc = Jsoup.parse(html, finalUrl.ifBlank { source.baseUrl })
@@ -641,16 +767,25 @@ class UnifiedSourceAdapter(
         )
       }
 
+      val baseForNext = finalUrl.ifBlank { source.baseUrl }
       val nextEl = if (cfg.nextPageLink.isNotBlank()) doc.selectFirst(cfg.nextPageLink) else null
-      val nextHref = nextEl?.attr("abs:href")?.ifBlank { nextEl.attr("href") }
+      val fallbackLinkEl = nextEl ?: doc.selectFirst("link[rel=next], a[rel=next]")
+      val rawNextHref = fallbackLinkEl?.attr("abs:href")?.ifBlank { fallbackLinkEl.attr("href") }
+      val nextHref = rawNextHref
+        ?.takeIf { it.isNotBlank() && !it.startsWith("#") && !it.startsWith("javascript:", ignoreCase = true) }
+        ?.let { resolveUrl(baseForNext, it) }
+        ?.takeIf { it != finalUrl && it != baseForNext }
 
       val parseErr = if (items.isEmpty()) {
         "Container matched ${containers.size} rows, but title selector '${cfg.title}' extracted 0 titles."
       } else null
 
+      val hasMore = !nextHref.isNullOrBlank() ||
+        (items.isNotEmpty() && parseErr == null && activeTemplateUsesPage(source, query) && page < MAX_PAGINATION_PAGES)
+
       SourceParseOutcome(
         items = items,
-        hasNextPage = !nextHref.isNullOrBlank(),
+        hasNextPage = hasMore,
         nextPageUrl = nextHref,
         parseError = parseErr
       )

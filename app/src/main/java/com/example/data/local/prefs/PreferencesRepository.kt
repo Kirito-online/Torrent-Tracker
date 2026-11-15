@@ -93,4 +93,19 @@ class PreferencesRepository(private val context: Context) {
   suspend fun updatePreferHttps(prefer: Boolean) {
     context.dataStore.edit { it[Keys.PREFER_HTTPS] = prefer }
   }
+
+  suspend fun applyBackupPreferences(entry: com.example.domain.model.BackupPreferencesEntry) {
+    context.dataStore.edit { prefs ->
+      prefs[Keys.THEME_MODE] = entry.themeMode.name
+      prefs[Keys.ACCENT_COLOR] = entry.accentColor.name
+      prefs[Keys.DISPLAY_DENSITY] = entry.displayDensity.name
+      prefs[Keys.DEFAULT_CATEGORY] = entry.defaultCategory.name
+      prefs[Keys.DEFAULT_SORT] = entry.defaultSort.name
+      prefs[Keys.SEARCH_DEBOUNCE_MS] = entry.searchDebounceMs.coerceIn(150, 1200)
+      prefs[Keys.AUTO_REFRESH_ON_LAUNCH] = entry.autoRefreshOnLaunch
+      prefs[Keys.SOURCE_TIMEOUT_SECONDS] = entry.sourceTimeoutSeconds.coerceIn(5, 30)
+      prefs[Keys.MAX_CONCURRENT_SOURCES] = entry.maxConcurrentSources.coerceIn(1, 8)
+      prefs[Keys.PREFER_HTTPS] = entry.preferHttps
+    }
+  }
 }

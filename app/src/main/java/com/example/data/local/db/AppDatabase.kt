@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.domain.model.HtmlSelectorConfig
 import com.example.domain.model.JsonMappingConfig
 import com.example.domain.model.SourceType
@@ -18,7 +20,7 @@ import kotlinx.serialization.json.Json
     SearchHistoryEntity::class,
     CachedTorrentEntity::class
   ],
-  version = 1,
+  version = 2,
   exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -30,12 +32,33 @@ abstract class AppDatabase : RoomDatabase() {
   companion object {
     const val DB_NAME = "torrent_tracker.db"
 
+    val MIGRATION_1_2 = object : Migration(1, 2) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE torrent_sources ADD COLUMN allowCleartextHttp INTEGER NOT NULL DEFAULT 0")
+        db.execSQL(
+          """
+          UPDATE torrent_sources
+          SET allowCleartextHttp = 1
+          WHERE LOWER(baseUrl) LIKE 'http://%'
+             OR LOWER(searchUrlTemplate) LIKE 'http://%'
+             OR LOWER(feedUrl) LIKE 'http://%'
+          """.trimIndent()
+        )
+        db.execSQL("ALTER TABLE favorite_torrents ADD COLUMN alternateSourcesJson TEXT NOT NULL DEFAULT '[]'")
+        db.execSQL("ALTER TABLE cached_torrents ADD COLUMN alternateSourcesJson TEXT NOT NULL DEFAULT '[]'")
+      }
+    }
+
+    val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2)
+
     fun build(context: Context): AppDatabase {
       return Room.databaseBuilder(
         context.applicationContext,
         AppDatabase::class.java,
         DB_NAME
-      ).build()
+      )
+        .addMigrations(*ALL_MIGRATIONS)
+        .build()
     }
   }
 }

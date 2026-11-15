@@ -1,5 +1,8 @@
 package com.example.ui.screens
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,8 +29,15 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -36,33 +46,51 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
 import com.example.data.parser.TorrentMetadataParser
 import com.example.domain.model.AccentColorOption
+import com.example.domain.model.BackupSelection
 import com.example.domain.model.DisplayDensity
+import com.example.domain.model.RestoreMode
 import com.example.domain.model.SortOption
 import com.example.domain.model.SourceProgressState
 import com.example.domain.model.StorageUsageInfo
 import com.example.domain.model.ThemeMode
 import com.example.domain.model.TorrentCategory
 import com.example.domain.model.TorrentSource
+import com.example.domain.model.TorrentTrackerBackup
 import com.example.domain.model.UserPreferences
 import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.SeederGreen
+import com.example.ui.theme.WarningOrange
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -71,6 +99,8 @@ fun SettingsScreen(
   storageUsage: StorageUsageInfo,
   diagnosticsResults: List<Pair<TorrentSource, SourceProgressState>>,
   isRunningDiagnostics: Boolean,
+  pendingImportBackup: TorrentTrackerBackup? = null,
+  isProcessingBackup: Boolean = false,
   onBack: () -> Unit,
   onRefreshStorageStats: () -> Unit,
   onThemeChanged: (ThemeMode) -> Unit,
@@ -88,8 +118,68 @@ fun SettingsScreen(
   onClearImageCache: () -> Unit,
   onClearSearchHistory: () -> Unit,
   onClearTempCache: () -> Unit,
+  onBuildBackupJson: suspend (BackupSelection) -> String = { "{}" },
+  onLoadImportJson: (String) -> Unit = {},
+  onConfirmRestoreBackup: (BackupSelection, RestoreMode) -> Unit = { _, _ -> },
+  onDismissImportPreview: () -> Unit = {},
+  onBackupFeedback: (String) -> Unit = {},
   onOpenAbout: () -> Unit
 ) {
+  val context = LocalContext.current
+  val scope = rememberCoroutineScope()
+  var showExportDialog by remember { mutableStateOf(false) }
+  var exportSelection by remember { mutableStateOf(BackupSelection()) }
+
+  val createBackupLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("application/json")
+  ) { uri: Uri? ->
+    if (uri == null) return@rememberLauncherForActivityResult
+    scope.launch {
+      runCatching {
+        val json = onBuildBackupJson(exportSelection)
+        withContext(Dispatchers.IO) {
+          context.contentResolver.openOutputStream(uri)?.use { out ->
+            out.write(json.toByteArray(Charsets.UTF_8))
+          } ?: error("Unable to open output file")
+        }
+      }.onSuccess {
+        onBackupFeedback("Backup exported successfully")
+      }.onFailure { err ->
+        onBackupFeedback("Export failed: ${err.localizedMessage ?: "I/O error"}")
+      }
+    }
+  }
+
+  val openBackupLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocument()
+  ) { uri: Uri? ->
+    if (uri == null) return@rememberLauncherForActivityResult
+    scope.launch {
+      runCatching {
+        withContext(Dispatchers.IO) {
+          context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { reader ->
+            val maxChars = 4 * 1024 * 1024
+            val sb = StringBuilder()
+            val buf = CharArray(8192)
+            var total = 0
+            while (true) {
+              val read = reader.read(buf)
+              if (read == -1) break
+              total += read
+              if (total > maxChars) error("Backup file exceeds 4 MB safety limit")
+              sb.appendRange(buf, 0, read)
+            }
+            sb.toString()
+          } ?: error("Unable to read selected file")
+        }
+      }.onSuccess { jsonText ->
+        onLoadImportJson(jsonText)
+      }.onFailure { err ->
+        onBackupFeedback("Could not read backup: ${err.localizedMessage ?: "I/O error"}")
+      }
+    }
+  }
+
   LaunchedEffect(Unit) {
     onRefreshStorageStats()
   }
@@ -379,7 +469,42 @@ fun SettingsScreen(
 
       HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.outlineVariant)
 
-      // 5. About
+      // 5. Backup & Restore
+      SettingsSectionHeader("Backup & Restore")
+      Text(
+        "Export or import sources, favorites, collections, preferences, and optional search history as portable JSON. Session cookies and private tokens are never included.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+      )
+      Spacer(Modifier.height(8.dp))
+      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(
+          onClick = { showExportDialog = true },
+          enabled = !isProcessingBackup,
+          modifier = Modifier
+            .weight(1f)
+            .testTag("export_backup_button")
+        ) {
+          Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+          Spacer(Modifier.width(6.dp))
+          Text("Export Backup", style = MaterialTheme.typography.labelMedium)
+        }
+        OutlinedButton(
+          onClick = { openBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) },
+          enabled = !isProcessingBackup,
+          modifier = Modifier
+            .weight(1f)
+            .testTag("import_backup_button")
+        ) {
+          Icon(Icons.Filled.UploadFile, null, modifier = Modifier.size(16.dp))
+          Spacer(Modifier.width(6.dp))
+          Text("Import Backup", style = MaterialTheme.typography.labelMedium)
+        }
+      }
+
+      HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.outlineVariant)
+
+      // 6. About
       SettingsSectionHeader("About")
       Row(
         modifier = Modifier
@@ -403,6 +528,211 @@ fun SettingsScreen(
 
       Spacer(Modifier.height(24.dp))
     }
+  }
+
+  if (showExportDialog) {
+    AlertDialog(
+      onDismissRequest = { showExportDialog = false },
+      title = { Text("Export Backup") },
+      text = {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+          Text(
+            "Choose what to include in the JSON backup:",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+          Spacer(Modifier.height(4.dp))
+          BackupCategoryCheckbox(
+            label = "Torrent Sources & Selectors",
+            checked = exportSelection.includeSources,
+            onToggle = { exportSelection = exportSelection.copy(includeSources = it) }
+          )
+          BackupCategoryCheckbox(
+            label = "Favorites & Collections",
+            checked = exportSelection.includeFavoritesAndCollections,
+            onToggle = { exportSelection = exportSelection.copy(includeFavoritesAndCollections = it) }
+          )
+          BackupCategoryCheckbox(
+            label = "App Preferences",
+            checked = exportSelection.includePreferences,
+            onToggle = { exportSelection = exportSelection.copy(includePreferences = it) }
+          )
+          BackupCategoryCheckbox(
+            label = "Search History (Optional)",
+            checked = exportSelection.includeSearchHistory,
+            onToggle = { exportSelection = exportSelection.copy(includeSearchHistory = it) }
+          )
+        }
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            showExportDialog = false
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+            createBackupLauncher.launch("torrent-tracker-backup-$stamp.json")
+          },
+          enabled = exportSelection.hasAnySelected
+        ) {
+          Text("Save File…")
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showExportDialog = false }) { Text("Cancel") }
+      }
+    )
+  }
+
+  pendingImportBackup?.let { backup ->
+    var importSelection by remember(backup) {
+      mutableStateOf(
+        BackupSelection(
+          includeSources = backup.sources.isNotEmpty(),
+          includeFavoritesAndCollections = backup.favorites.isNotEmpty() || backup.collections.isNotEmpty(),
+          includePreferences = backup.preferences != null,
+          includeSearchHistory = backup.searchHistory.isNotEmpty()
+        )
+      )
+    }
+    var restoreMode by remember(backup) { mutableStateOf(RestoreMode.MERGE) }
+    val dateFmt = remember(backup.exportedAt) {
+      SimpleDateFormat("MMM d, yyyy HH:mm", Locale.getDefault()).format(Date(backup.exportedAt))
+    }
+
+    AlertDialog(
+      onDismissRequest = { if (!isProcessingBackup) onDismissImportPreview() },
+      title = { Text("Restore Backup Preview") },
+      text = {
+        Column(
+          modifier = Modifier.verticalScroll(rememberScrollState()),
+          verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+          Text(
+            "Schema v${backup.schemaVersion} · Exported $dateFmt",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+          if (backup.sources.isNotEmpty()) {
+            BackupCategoryCheckbox(
+              label = "Sources (${backup.sources.size})",
+              checked = importSelection.includeSources,
+              onToggle = { importSelection = importSelection.copy(includeSources = it) }
+            )
+          }
+          if (backup.favorites.isNotEmpty() || backup.collections.isNotEmpty()) {
+            BackupCategoryCheckbox(
+              label = "Favorites (${backup.favorites.size}) & Collections (${backup.collections.size})",
+              checked = importSelection.includeFavoritesAndCollections,
+              onToggle = { importSelection = importSelection.copy(includeFavoritesAndCollections = it) }
+            )
+          }
+          if (backup.preferences != null) {
+            BackupCategoryCheckbox(
+              label = "App Preferences",
+              checked = importSelection.includePreferences,
+              onToggle = { importSelection = importSelection.copy(includePreferences = it) }
+            )
+          }
+          if (backup.searchHistory.isNotEmpty()) {
+            BackupCategoryCheckbox(
+              label = "Search History (${backup.searchHistory.size})",
+              checked = importSelection.includeSearchHistory,
+              onToggle = { importSelection = importSelection.copy(includeSearchHistory = it) }
+            )
+          }
+
+          HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant)
+          Text("Restore Mode", style = MaterialTheme.typography.titleSmall)
+          RestoreMode.entries.forEach { mode ->
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { restoreMode = mode }
+                .padding(vertical = 4.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              RadioButton(selected = restoreMode == mode, onClick = null)
+              Spacer(Modifier.width(6.dp))
+              Column {
+                Text(mode.label, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                  text = if (mode == RestoreMode.MERGE) {
+                    "Updates matching IDs and preserves your other existing items."
+                  } else {
+                    "Deletes all existing items in selected categories before restoring."
+                  },
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+              }
+            }
+          }
+
+          if (restoreMode == RestoreMode.REPLACE) {
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(ErrorRed.copy(alpha = 0.12f))
+                .border(0.5.dp, ErrorRed, RoundedCornerShape(8.dp))
+                .padding(8.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Icon(Icons.Filled.Warning, null, tint = ErrorRed, modifier = Modifier.size(18.dp))
+              Spacer(Modifier.width(8.dp))
+              Text(
+                "Destructive action: existing data in checked categories will be overwritten.",
+                style = MaterialTheme.typography.labelSmall,
+                color = ErrorRed
+              )
+            }
+          }
+        }
+      },
+      confirmButton = {
+        Button(
+          onClick = { onConfirmRestoreBackup(importSelection, restoreMode) },
+          enabled = importSelection.hasAnySelected && !isProcessingBackup,
+          colors = if (restoreMode == RestoreMode.REPLACE) {
+            ButtonDefaults.buttonColors(containerColor = ErrorRed)
+          } else {
+            ButtonDefaults.buttonColors()
+          }
+        ) {
+          if (isProcessingBackup) {
+            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+          } else {
+            Text(if (restoreMode == RestoreMode.REPLACE) "Replace Data" else "Merge Backup")
+          }
+        }
+      },
+      dismissButton = {
+        TextButton(
+          onClick = onDismissImportPreview,
+          enabled = !isProcessingBackup
+        ) { Text("Cancel") }
+      }
+    )
+  }
+}
+
+@Composable
+private fun BackupCategoryCheckbox(
+  label: String,
+  checked: Boolean,
+  onToggle: (Boolean) -> Unit
+) {
+  Row(
+    modifier = Modifier
+      .fillMaxWidth()
+      .clip(RoundedCornerShape(6.dp))
+      .clickable { onToggle(!checked) }
+      .padding(vertical = 2.dp),
+    verticalAlignment = Alignment.CenterVertically
+  ) {
+    Checkbox(checked = checked, onCheckedChange = null)
+    Spacer(Modifier.width(6.dp))
+    Text(label, style = MaterialTheme.typography.bodyMedium)
   }
 }
 

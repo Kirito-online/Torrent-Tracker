@@ -4,11 +4,15 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.prefs.PreferencesRepository
+import com.example.data.parser.TorrentMetadataParser
+import com.example.data.parser.UnifiedSourceAdapter
 import com.example.data.repository.ProgressiveSearchEvent
+import com.example.data.repository.SourcePageRequest
 import com.example.data.repository.TorrentRepository
 import com.example.domain.model.FileSizeRange
 import com.example.domain.model.SearchFilterState
 import com.example.domain.model.SortOption
+import com.example.domain.model.SourceHealth
 import com.example.domain.model.SourceProgressState
 import com.example.domain.model.TorrentCategory
 import com.example.domain.model.TorrentItem
@@ -44,6 +48,13 @@ data class SearchUiState(
   val selectedTorrent: TorrentItem? = null
 )
 
+private data class SourcePageCursor(
+  val nextPage: Int,
+  val nextPageUrl: String?,
+  val hasMore: Boolean,
+  val visitedUrls: Set<String>
+)
+
 class SearchViewModel(
   private val repository: TorrentRepository,
   private val preferencesRepository: PreferencesRepository
@@ -64,14 +75,16 @@ class SearchViewModel(
   val uiState: StateFlow<SearchUiState> = combine(
     _uiState,
     rawItems,
-    favoriteIds
-  ) { state, items, favIds ->
+    favoriteIds,
+    sources
+  ) { state, items, favIds, sourceList ->
     val effectiveFilter = if (state.activeCategoryTab != TorrentCategory.ALL && state.filterState.selectedCategories.isEmpty()) {
       state.filterState.copy(selectedCategories = setOf(state.activeCategoryTab))
     } else {
       state.filterState
     }
-    val processed = repository.deduplicateAndFilter(items, favIds, effectiveFilter)
+    val healthMap: Map<String, SourceHealth> = sourceList.associate { it.id to it.health }
+    val processed = repository.deduplicateAndFilter(items, favIds, effectiveFilter, healthMap)
     val updatedSelected = state.selectedTorrent?.let { sel ->
       processed.firstOrNull { it.id == sel.id } ?: sel.copy(isFavorite = favIds.contains(sel.id))
     }
@@ -80,6 +93,9 @@ class SearchViewModel(
 
   private var searchJob: Job? = null
   private var debounceJob: Job? = null
+  private var searchGeneration: Long = 0L
+  private val sourceCursors = mutableMapOf<String, SourcePageCursor>()
+  private val seenKeysPerSource = mutableMapOf<String, MutableSet<String>>()
 
   init {
     viewModelScope.launch {
@@ -125,8 +141,29 @@ class SearchViewModel(
 
   fun loadNextPage() {
     val state = _uiState.value
-    if (state.isLoading || state.isLoadingMore || !state.hasMorePages) return
-    executeSearch(query = state.query, page = state.currentPage + 1, isRefresh = false, append = true)
+    if (state.isLoading || state.isRefreshing || state.isLoadingMore || !state.hasMorePages) return
+
+    val nextRequests = buildMap {
+      sourceCursors.forEach { (sourceId, cursor) ->
+        if (cursor.hasMore && cursor.nextPage <= UnifiedSourceAdapter.MAX_PAGINATION_PAGES) {
+          val nextUrl = cursor.nextPageUrl
+          if (nextUrl == null || !cursor.visitedUrls.contains(nextUrl)) {
+            put(sourceId, SourcePageRequest(sourceId = sourceId, page = cursor.nextPage, overrideUrl = nextUrl))
+          }
+        }
+      }
+    }
+    if (nextRequests.isEmpty()) {
+      _uiState.update { it.copy(hasMorePages = false) }
+      return
+    }
+    executeSearch(
+      query = state.query,
+      page = state.currentPage + 1,
+      isRefresh = false,
+      append = true,
+      pageRequests = nextRequests
+    )
   }
 
   private fun executeSearch(
@@ -134,13 +171,20 @@ class SearchViewModel(
     page: Int,
     isRefresh: Boolean,
     append: Boolean = false,
-    specificSourceId: String? = null
+    specificSourceId: String? = null,
+    pageRequests: Map<String, SourcePageRequest> = emptyMap()
   ) {
     searchJob?.cancel()
+    val gen = ++searchGeneration
     searchJob = viewModelScope.launch {
       val prefs = preferences.value
       val currentSources = repository.observeSources().first()
       val enabledCount = currentSources.count { it.enabled }
+
+      if (!append && specificSourceId == null) {
+        sourceCursors.clear()
+        seenKeysPerSource.clear()
+      }
 
       _uiState.update {
         it.copy(
@@ -152,6 +196,8 @@ class SearchViewModel(
           usingCachedResults = false,
           sourceProgress = if (specificSourceId != null) {
             it.sourceProgress + (specificSourceId to SourceProgressState.Loading)
+          } else if (append) {
+            it.sourceProgress
           } else {
             emptyMap()
           },
@@ -171,15 +217,18 @@ class SearchViewModel(
       }
 
       var anySuccess = false
-      var anyMorePages = false
 
       repository.searchAcrossSources(
         query = query,
         page = page,
         timeoutSeconds = prefs.sourceTimeoutSeconds,
         maxConcurrency = prefs.maxConcurrentSources,
-        specificSourceId = specificSourceId
+        specificSourceId = specificSourceId,
+        preferHttps = prefs.preferHttps,
+        forceNetwork = isRefresh,
+        pageRequests = pageRequests
       ).collect { event ->
+        if (gen != searchGeneration) return@collect
         when (event) {
           is ProgressiveSearchEvent.CachedFallbackLoaded -> {
             if (rawItems.value.isEmpty()) {
@@ -198,7 +247,33 @@ class SearchViewModel(
           is ProgressiveSearchEvent.SourceCompleted -> {
             if (event.progress is SourceProgressState.Success) {
               anySuccess = true
-              if (event.hasMore) anyMorePages = true
+
+              // Track per-source seen keys & visited URLs to prevent pagination loops or duplicates
+              val seen = seenKeysPerSource.getOrPut(event.sourceId) { mutableSetOf() }
+              val prevCursor = sourceCursors[event.sourceId]
+              val newUniqueItems = if (!append) {
+                seen.clear()
+                event.items.filter { seen.add(TorrentMetadataParser.computeConservativeGroupKey(it) + "|" + it.sourceUrl.orEmpty()) }
+              } else {
+                event.items.filter { seen.add(TorrentMetadataParser.computeConservativeGroupKey(it) + "|" + it.sourceUrl.orEmpty()) }
+              }
+
+              val visited = (prevCursor?.visitedUrls ?: emptySet()) +
+                listOfNotNull(event.requestUrl.takeIf { it.isNotBlank() })
+              val nextUrl = event.nextPageUrl?.takeIf { it.isNotBlank() && !visited.contains(it) }
+              val curPage = pageRequests[event.sourceId]?.page ?: page
+              val sourceStillHasMore = event.hasMore &&
+                newUniqueItems.isNotEmpty() &&
+                curPage < UnifiedSourceAdapter.MAX_PAGINATION_PAGES &&
+                (event.nextPageUrl == null || nextUrl != null)
+
+              sourceCursors[event.sourceId] = SourcePageCursor(
+                nextPage = curPage + 1,
+                nextPageUrl = nextUrl,
+                hasMore = sourceStillHasMore,
+                visitedUrls = visited
+              )
+
               rawItems.update { existing ->
                 if (!append && specificSourceId == null && _uiState.value.usingCachedResults) {
                   _uiState.update { it.copy(usingCachedResults = false) }
@@ -206,8 +281,14 @@ class SearchViewModel(
                 } else if (specificSourceId != null) {
                   existing.filterNot { it.sourceId == event.sourceId } + event.items
                 } else {
-                  existing + event.items
+                  existing + newUniqueItems
                 }
+              }
+            } else {
+              // Error or empty: mark this source exhausted for pagination
+              val prev = sourceCursors[event.sourceId]
+              if (prev != null) {
+                sourceCursors[event.sourceId] = prev.copy(hasMore = false)
               }
             }
             _uiState.update { state ->
@@ -219,7 +300,9 @@ class SearchViewModel(
         }
       }
 
+      if (gen != searchGeneration) return@launch
       val now = System.currentTimeMillis()
+      val anyMorePages = sourceCursors.values.any { it.hasMore }
       _uiState.update {
         it.copy(
           isLoading = false,

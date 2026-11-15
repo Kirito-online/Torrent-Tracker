@@ -85,7 +85,8 @@ fun FavoritesScreen(
   onDeleteCollection: (String) -> Unit,
   onMoveToCollection: (String, String?) -> Unit,
   onToggleFavorite: (TorrentItem) -> Unit,
-  onOpenDetail: (TorrentItem) -> Unit
+  onOpenDetail: (TorrentItem) -> Unit,
+  onFeedback: (String) -> Unit = {}
 ) {
   var showSortMenu by remember { mutableStateOf(false) }
   var showNewCollectionDialog by remember { mutableStateOf(false) }
@@ -267,7 +268,8 @@ fun FavoritesScreen(
                 item = item,
                 density = density,
                 onClick = { onOpenDetail(item) },
-                onToggleFavorite = { onToggleFavorite(item) }
+                onToggleFavorite = { onToggleFavorite(item) },
+                onFeedback = onFeedback
               )
               if (collections.isNotEmpty()) {
                 Row(

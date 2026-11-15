@@ -39,6 +39,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,8 +70,10 @@ fun TorrentResultRow(
   isSelected: Boolean = false,
   onClick: () -> Unit,
   onToggleFavorite: () -> Unit,
+  onFeedback: (String) -> Unit = {},
   modifier: Modifier = Modifier
 ) {
+  var showAlternativesSheet by remember { mutableStateOf(false) }
   val isCompact = density == DisplayDensity.COMPACT
   val verticalPadding = if (isCompact) 8.dp else 12.dp
   val coverWidth = if (isCompact) 58.dp else 70.dp
@@ -276,6 +282,22 @@ fun TorrentResultRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
           )
+          if (item.sourceCount > 1) {
+            Box(
+              modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f))
+                .clickable { showAlternativesSheet = true }
+                .padding(horizontal = 5.dp, vertical = 1.dp)
+                .testTag("sources_badge_${item.id}")
+            ) {
+              Text(
+                text = "+${item.sourceCount - 1} sources",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer
+              )
+            }
+          }
           if (item.hasMagnet) {
             Row(verticalAlignment = Alignment.CenterVertically) {
               Icon(
@@ -299,6 +321,14 @@ fun TorrentResultRow(
     HorizontalDivider(
       thickness = 0.5.dp,
       color = MaterialTheme.colorScheme.outlineVariant
+    )
+  }
+
+  if (showAlternativesSheet) {
+    SourceAlternativesBottomSheet(
+      item = item,
+      onFeedback = onFeedback,
+      onDismiss = { showAlternativesSheet = false }
     )
   }
 }

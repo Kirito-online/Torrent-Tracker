@@ -127,9 +127,14 @@ class SourcesViewModel(
 
   fun testSource(source: TorrentSource) {
     viewModelScope.launch {
-      val timeout = preferencesRepository.preferencesFlow.first().sourceTimeoutSeconds
+      val prefs = preferencesRepository.preferencesFlow.first()
       _uiState.update { it.copy(testingSourceIds = it.testingSourceIds + source.id) }
-      val result = repository.testSingleSource(source, timeout)
+      val result = repository.testSingleSource(
+        source = source,
+        timeoutSeconds = prefs.sourceTimeoutSeconds,
+        preferHttps = prefs.preferHttps,
+        forceNetwork = true
+      )
       val msg = when (result) {
         is SourceProgressState.Success -> "${source.name}: OK (${result.count} items in ${result.durationMs}ms)"
         is SourceProgressState.Error -> "${source.name}: ${result.message}"
@@ -146,9 +151,13 @@ class SourcesViewModel(
 
   fun refreshAllSources() {
     viewModelScope.launch {
-      val timeout = preferencesRepository.preferencesFlow.first().sourceTimeoutSeconds
+      val prefs = preferencesRepository.preferencesFlow.first()
       _uiState.update { it.copy(isRefreshingAll = true) }
-      val results = repository.runAllSourcesDiagnostic(timeout)
+      val results = repository.runAllSourcesDiagnostic(
+        timeoutSeconds = prefs.sourceTimeoutSeconds,
+        maxConcurrency = prefs.maxConcurrentSources,
+        preferHttps = prefs.preferHttps
+      )
       val okCount = results.count { it.second is SourceProgressState.Success }
       _uiState.update {
         it.copy(
@@ -234,9 +243,13 @@ class SourcesViewModel(
 
   fun retryAfterCloudflareVerification(sourceId: String) {
     viewModelScope.launch {
-      val timeout = preferencesRepository.preferencesFlow.first().sourceTimeoutSeconds
+      val prefs = preferencesRepository.preferencesFlow.first()
       _uiState.update { it.copy(testingSourceIds = it.testingSourceIds + sourceId) }
-      val res = repository.markCloudflareVerifiedCheck(sourceId, timeout)
+      val res = repository.markCloudflareVerifiedCheck(
+        sourceId = sourceId,
+        timeoutSeconds = prefs.sourceTimeoutSeconds,
+        preferHttps = prefs.preferHttps
+      )
       val msg = when (res) {
         is SourceProgressState.Success -> "Verification succeeded! Source is accessible again (${res.count} items)."
         is SourceProgressState.Error ->
