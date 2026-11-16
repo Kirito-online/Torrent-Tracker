@@ -42,7 +42,7 @@ interface SourceAdapter {
     timeoutSeconds: Int,
     overrideUrl: String? = null,
     forceNetwork: Boolean = false,
-    allowCleartext: Boolean = true
+    allowCleartext: Boolean = false
   ): AdapterFetchResult
 }
 
@@ -108,7 +108,7 @@ class UnifiedSourceAdapter(
     val outcome = when (source.sourceType) {
       SourceType.RSS_ATOM -> parseRssOrAtom(source, response.body, query, page, response.finalUrl.ifBlank { targetUrl })
       SourceType.JSON_API -> parseJsonApi(source, response.body, query, page, response.finalUrl.ifBlank { targetUrl })
-      SourceType.HTML_SELECTOR -> parseHtmlWithSelectors(source, response.body, response.finalUrl, query, page)
+      SourceType.HTML_SELECTOR -> parseHtmlWithSelectors(source, response.body, response.finalUrl.ifBlank { targetUrl }, query, page)
     }
 
     return AdapterFetchResult(
@@ -609,16 +609,15 @@ class UnifiedSourceAdapter(
     if (itemCount == 0 || currentPage >= MAX_PAGINATION_PAGES) return false to null
 
     if (root != null) {
-      // 1. Direct next-page URL keys
+      // 1. Direct next-page URL keys (supports absolute, /root-relative, path-relative, and ?query-relative URLs)
+      val baseForNext = requestUrl.ifBlank { source.baseUrl }
       val urlCandidates = listOf("next", "next_page_url", "nextPageUrl", "pagination.next", "pagination.next_url", "links.next", "meta.next")
       for (key in urlCandidates) {
         val raw = readJsonString(root, key)
         if (!raw.isNullOrBlank() && raw != "null" && raw != "false") {
-          if (raw.startsWith("http://", true) || raw.startsWith("https://", true) || raw.startsWith("/")) {
-            val resolved = resolveUrl(requestUrl.ifBlank { source.baseUrl }, raw)
-            if (!resolved.isNullOrBlank() && resolved != requestUrl) {
-              return true to resolved
-            }
+          val resolved = resolveUrl(baseForNext, raw)
+          if (!resolved.isNullOrBlank() && resolved != baseForNext && resolved != requestUrl) {
+            return true to resolved
           }
         }
       }
@@ -798,12 +797,16 @@ class UnifiedSourceAdapter(
     }
   }
 
-  suspend fun detectFeedsFromWebsite(websiteUrl: String, timeoutSeconds: Int = 10): List<DetectedFeed> {
+  suspend fun detectFeedsFromWebsite(
+    websiteUrl: String,
+    timeoutSeconds: Int = 10,
+    allowCleartext: Boolean = false
+  ): List<DetectedFeed> {
     val cleanUrl = websiteUrl.trim().let {
-      if (!it.startsWith("http://") && !it.startsWith("https://")) "https://$it" else it
+      if (!it.startsWith("http://", true) && !it.startsWith("https://", true)) "https://$it" else it
     }
     val detected = mutableListOf<DetectedFeed>()
-    val res = httpClient.fetch(cleanUrl, timeoutSeconds = timeoutSeconds)
+    val res = httpClient.fetch(cleanUrl, timeoutSeconds = timeoutSeconds, allowCleartext = allowCleartext)
     if (res.isSuccessful && !res.body.isNullOrBlank()) {
       val trimmed = res.body.trim()
       if (trimmed.startsWith("<rss", true) || trimmed.startsWith("<feed", true) || trimmed.contains("<rss", true)) {
@@ -830,7 +833,7 @@ class UnifiedSourceAdapter(
       val candidates = listOf("/rss.xml", "/feed/", "/rss", "/atom.xml", "/rss.php")
       for (path in candidates) {
         val probeUrl = "$base$path"
-        val probe = httpClient.fetch(probeUrl, timeoutSeconds = 5)
+        val probe = httpClient.fetch(probeUrl, timeoutSeconds = 5, allowCleartext = allowCleartext)
         val b = probe.body.orEmpty()
         if (probe.isSuccessful && (b.contains("<rss", true) || b.contains("<feed", true))) {
           detected.add(DetectedFeed(probe.finalUrl, "Discovered feed ($path)", SourceType.RSS_ATOM))
@@ -841,11 +844,15 @@ class UnifiedSourceAdapter(
     return detected.distinctBy { it.url }
   }
 
-  suspend fun discoverSourceFromUrl(rawInput: String, timeoutSeconds: Int = 10): DiscoveredSourceCandidate {
+  suspend fun discoverSourceFromUrl(
+    rawInput: String,
+    timeoutSeconds: Int = 10,
+    allowCleartext: Boolean = false
+  ): DiscoveredSourceCandidate {
     val normalizedUrl = rawInput.trim().let {
       if (!it.startsWith("http://", true) && !it.startsWith("https://", true)) "https://$it" else it
     }
-    val res = httpClient.fetch(normalizedUrl, timeoutSeconds = timeoutSeconds)
+    val res = httpClient.fetch(normalizedUrl, timeoutSeconds = timeoutSeconds, allowCleartext = allowCleartext)
     if (!res.isSuccessful && !res.isCloudflareChallenge) {
       return DiscoveredSourceCandidate(
         source = null,
@@ -927,7 +934,7 @@ class UnifiedSourceAdapter(
     val doc = Jsoup.parse(body, res.finalUrl)
     val pageTitle = doc.title().substringBefore(" - ").substringBefore(" | ").trim()
       .takeIf { it.isNotBlank() }?.take(36) ?: hostLabel
-    val feeds = detectFeedsFromWebsite(res.finalUrl, timeoutSeconds)
+    val feeds = detectFeedsFromWebsite(res.finalUrl, timeoutSeconds, allowCleartext = allowCleartext)
     val primaryFeed = feeds.firstOrNull()
 
     val searchForm = doc.selectFirst("form[action*=search], form:has(input[type=search]), form:has(input[name=q]), form:has(input[name=s])")
@@ -1155,14 +1162,45 @@ class UnifiedSourceAdapter(
     return raw.toString().replace(",", "").toDoubleOrNull()?.toInt()
   }
 
-  private fun resolveUrl(base: String, raw: String?): String? {
+  internal fun resolveUrl(base: String, raw: String?): String? {
     if (raw.isNullOrBlank()) return null
     val trimmed = raw.trim()
-    if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) || trimmed.startsWith("magnet:", true)) {
+    val lower = trimmed.lowercase()
+    if (lower.startsWith("#") ||
+      lower.startsWith("javascript:") ||
+      lower.startsWith("data:") ||
+      lower.startsWith("vbscript:") ||
+      lower.startsWith("file:") ||
+      lower.startsWith("about:")
+    ) {
+      return null
+    }
+    if (lower.startsWith("magnet:")) {
       return trimmed
     }
-    return runCatching {
-      URI(base).resolve(trimmed).toString()
-    }.getOrNull()
+    val candidate = if (lower.startsWith("http://") || lower.startsWith("https://")) {
+      runCatching { URI(trimmed) }.getOrNull()
+    } else {
+      runCatching {
+        val baseUri = URI(base.trim())
+        if (trimmed.startsWith("?")) {
+          URI(
+            baseUri.scheme,
+            baseUri.authority,
+            baseUri.path.ifBlank { "/" },
+            trimmed.removePrefix("?"),
+            null
+          )
+        } else {
+          baseUri.resolve(trimmed)
+        }
+      }.getOrNull()
+    } ?: return null
+
+    val scheme = candidate.scheme?.lowercase() ?: return null
+    if ((scheme != "http" && scheme != "https") || candidate.host.isNullOrBlank()) {
+      return null
+    }
+    return candidate.toString()
   }
 }

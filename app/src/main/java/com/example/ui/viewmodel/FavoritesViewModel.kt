@@ -10,6 +10,7 @@ import com.example.domain.model.SearchHistoryItem
 import com.example.domain.model.SortOption
 import com.example.domain.model.TorrentCategory
 import com.example.domain.model.TorrentItem
+import com.example.domain.model.TorrentSourceOffer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -109,6 +110,10 @@ class FavoritesViewModel(
 
   fun moveFavoriteToCollection(torrentId: String, collectionId: String?) {
     viewModelScope.launch { repository.moveFavoriteToCollection(torrentId, collectionId) }
+  }
+
+  fun selectPreferredSourceOffer(torrentId: String, offer: TorrentSourceOffer) {
+    viewModelScope.launch { repository.updateFavoritePreferredOffer(torrentId, offer) }
   }
 
   fun deleteHistoryItem(id: Long) {

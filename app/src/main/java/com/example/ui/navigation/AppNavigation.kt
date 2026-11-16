@@ -246,6 +246,7 @@ fun AppNavigation(
                 onBack = { navController.popBackStack() },
                 onToggleFavorite = searchViewModel::toggleFavorite,
                 onMoveToCollection = favoritesViewModel::moveFavoriteToCollection,
+                onSelectSourceOffer = favoritesViewModel::selectPreferredSourceOffer,
                 onFeedback = ::showToast
               )
             }
@@ -372,6 +373,8 @@ fun AppNavigation(
                 onClearImageCache = settingsViewModel::clearImageCache,
                 onClearSearchHistory = settingsViewModel::clearSearchHistory,
                 onClearTempCache = settingsViewModel::clearTemporaryCache,
+                onClearCookies = settingsViewModel::clearVerificationCookies,
+                onBuildDiagnosticReport = settingsViewModel::buildDiagnosticReportText,
                 onBuildBackupJson = settingsViewModel::buildBackupJson,
                 onLoadImportJson = settingsViewModel::loadBackupForPreview,
                 onConfirmRestoreBackup = settingsViewModel::confirmRestoreBackup,

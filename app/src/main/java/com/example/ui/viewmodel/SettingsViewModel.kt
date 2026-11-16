@@ -97,6 +97,15 @@ class SettingsViewModel(
     }
   }
 
+  fun clearVerificationCookies() {
+    torrentRepository.clearVerificationCookies()
+    _feedbackMessage.value = "Browser verification & session cookies cleared"
+  }
+
+  suspend fun buildDiagnosticReportText(): String {
+    return torrentRepository.buildDiagnosticReportText(BuildConfig.VERSION_NAME)
+  }
+
   fun runConnectionDiagnostics() {
     viewModelScope.launch {
       val prefs = preferencesRepository.preferencesFlow.first()

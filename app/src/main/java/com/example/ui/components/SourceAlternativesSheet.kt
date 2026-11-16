@@ -41,10 +41,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.domain.model.SourceHealth
 import com.example.domain.model.TorrentItem
 import com.example.domain.model.TorrentSourceOffer
+import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.LeecherAmber
 import com.example.ui.theme.SeederGreen
+import com.example.ui.theme.WarningOrange
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -118,12 +121,28 @@ fun SourceAlternativesBottomSheet(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
               )
-              if (isRecommended) {
-                CompactLabelBadge(
-                  text = "Recommended",
-                  containerColor = MaterialTheme.colorScheme.primaryContainer,
-                  contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                )
+              Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (offer.sourceHealth != SourceHealth.UNKNOWN) {
+                  val (healthLabel, healthColor) = when (offer.sourceHealth) {
+                    SourceHealth.ONLINE -> "Online" to SeederGreen
+                    SourceHealth.REDIRECTED -> "Redirect" to WarningOrange
+                    SourceHealth.CLOUDFLARE_REQUIRED -> "CF" to WarningOrange
+                    SourceHealth.PARSE_ERROR, SourceHealth.OFFLINE, SourceHealth.DISABLED -> "Offline" to ErrorRed
+                    SourceHealth.UNKNOWN -> "" to SeederGreen
+                  }
+                  CompactLabelBadge(
+                    text = healthLabel,
+                    containerColor = healthColor.copy(alpha = 0.14f),
+                    contentColor = healthColor
+                  )
+                }
+                if (isRecommended) {
+                  CompactLabelBadge(
+                    text = "Recommended",
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                  )
+                }
               }
             }
 

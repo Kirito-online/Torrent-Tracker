@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <!--
-      User-configured custom torrent sources may point to arbitrary domains, including
-      legacy plain-HTTP hosts explicitly confirmed by the user. TorrentHttpClient enforces
-      HTTPS-by-default and requires per-source user confirmation before allowing HTTP.
+      Android network_security_config.xml is static at build time and cannot check
+      per-source runtime permissions. Because users may add custom plain-HTTP hosts
+      with explicit confirmation, OS-level cleartext is permitted here while app-level
+      TorrentHttpClient enforces HTTPS-by-default and blocks unauthorized HTTP requests
+      and HTTPS-to-HTTP downgrade redirects at runtime.
     -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>

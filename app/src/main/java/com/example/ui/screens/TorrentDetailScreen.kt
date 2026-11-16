@@ -60,6 +60,7 @@ import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import com.example.domain.model.FavoriteCollection
 import com.example.domain.model.TorrentItem
+import com.example.domain.model.TorrentSourceOffer
 import com.example.ui.components.CategoryFallbackIcon
 import com.example.ui.components.CompactLabelBadge
 import com.example.ui.components.SourceAlternativesBottomSheet
@@ -75,8 +76,13 @@ fun TorrentDetailScreen(
   onBack: () -> Unit,
   onToggleFavorite: (TorrentItem) -> Unit,
   onMoveToCollection: (String, String?) -> Unit,
+  onSelectSourceOffer: (String, TorrentSourceOffer) -> Unit = { _, _ -> },
   onFeedback: (String) -> Unit
 ) {
+  var selectedOffer by remember(item?.id, item?.availableSources) {
+    mutableStateOf(item?.allSourceOffers?.firstOrNull())
+  }
+
   Scaffold(
     topBar = {
       TopAppBar(
@@ -93,8 +99,31 @@ fun TorrentDetailScreen(
         },
         actions = {
           if (item != null) {
+            val chosen = selectedOffer ?: item.allSourceOffers.first()
             IconButton(
-              onClick = { onToggleFavorite(item) },
+              onClick = {
+                val reordered = listOf(chosen) + item.allSourceOffers.filterNot {
+                  it.sourceId == chosen.sourceId &&
+                    it.sourceUrl.orEmpty() == chosen.sourceUrl.orEmpty() &&
+                    it.magnetLink.orEmpty() == chosen.magnetLink.orEmpty()
+                }
+                val promoted = item.copy(
+                  sourceId = chosen.sourceId,
+                  sourceName = chosen.sourceName,
+                  sourceUrl = chosen.sourceUrl ?: item.sourceUrl,
+                  magnetLink = chosen.magnetLink ?: item.magnetLink,
+                  torrentFileUrl = chosen.torrentFileUrl ?: item.torrentFileUrl,
+                  seeders = chosen.seeders ?: item.seeders,
+                  leechers = chosen.leechers ?: item.leechers,
+                  fileSizeText = chosen.fileSizeText ?: item.fileSizeText,
+                  fileSizeBytes = chosen.fileSizeBytes ?: item.fileSizeBytes,
+                  uploadDateText = chosen.uploadDateText ?: item.uploadDateText,
+                  uploadTimestamp = chosen.uploadTimestamp ?: item.uploadTimestamp,
+                  uploader = chosen.uploader ?: item.uploader,
+                  availableSources = reordered
+                )
+                onToggleFavorite(promoted)
+              },
               modifier = Modifier
                 .minimumInteractiveComponentSize()
                 .testTag("detail_favorite_button")
@@ -123,6 +152,13 @@ fun TorrentDetailScreen(
       TorrentDetailContent(
         item = item,
         collections = collections,
+        selectedOffer = selectedOffer ?: item.allSourceOffers.first(),
+        onSelectOffer = { offer ->
+          selectedOffer = offer
+          if (item.isFavorite) {
+            onSelectSourceOffer(item.id, offer)
+          }
+        },
         onToggleFavorite = { onToggleFavorite(item) },
         onMoveToCollection = { colId -> onMoveToCollection(item.id, colId) },
         onFeedback = onFeedback,
@@ -137,6 +173,8 @@ fun TorrentDetailScreen(
 fun TorrentDetailContent(
   item: TorrentItem,
   collections: List<FavoriteCollection>,
+  selectedOffer: TorrentSourceOffer = item.allSourceOffers.first(),
+  onSelectOffer: (TorrentSourceOffer) -> Unit = {},
   onToggleFavorite: () -> Unit,
   onMoveToCollection: (String?) -> Unit,
   onFeedback: (String) -> Unit,
@@ -145,9 +183,6 @@ fun TorrentDetailContent(
   val context = LocalContext.current
   var showCollectionDialog by remember { mutableStateOf(false) }
   var showAllSourcesSheet by remember { mutableStateOf(false) }
-  var selectedOffer by remember(item.id, item.availableSources) {
-    mutableStateOf(item.allSourceOffers.first())
-  }
 
   Column(
     modifier = modifier
@@ -354,7 +389,7 @@ fun TorrentDetailContent(
           val seedLabel = offer.seeders?.let { " · ↑$it" }.orEmpty()
           FilterChip(
             selected = isChosen,
-            onClick = { selectedOffer = offer },
+            onClick = { onSelectOffer(offer) },
             label = {
               Text(
                 "${offer.sourceName}$seedLabel${if (idx == 0) " ★" else ""}",
@@ -468,7 +503,7 @@ fun TorrentDetailContent(
   if (showAllSourcesSheet) {
     SourceAlternativesBottomSheet(
       item = item,
-      onSelectAsPrimary = { offer -> selectedOffer = offer },
+      onSelectAsPrimary = { offer -> onSelectOffer(offer) },
       onFeedback = onFeedback,
       onDismiss = { showAllSourcesSheet = false }
     )

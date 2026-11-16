@@ -213,12 +213,21 @@ object TorrentMetadataParser {
   /**
    * Computes a conservative grouping key for multi-source aggregation.
    * - Verified infoHashes always group strictly by exact lowercase BTIH (never merges differing hashes).
-   * - When infoHash is absent, uses normalized title tokens plus releaseYear, season, episode, and resolution.
-   *   Callers must also verify file size compatibility via [areFallbackSizesCompatible] before merging.
+   * - When infoHash is absent, requires normalized title tokens PLUS strong release evidence
+   *   (year, season, episode, or resolution). Entries lacking metadata stay distinct so
+   *   unrelated releases are never collapsed together.
+   *   Callers must also verify known file size compatibility via [areFallbackSizesCompatible].
    */
   fun computeConservativeGroupKey(item: com.example.domain.model.TorrentItem): String {
     if (!item.infoHash.isNullOrBlank()) {
       return "btih:${item.infoHash.trim().lowercase()}"
+    }
+    val hasReleaseEvidence = item.releaseYear != null ||
+      item.season != null ||
+      item.episode != null ||
+      !item.resolution.isNullOrBlank()
+    if (!hasReleaseEvidence) {
+      return "unique:${item.sourceId}|${item.sourceUrl ?: item.id}"
     }
     val cleanedTitle = releaseNoiseRegex.replace(item.title.lowercase(), " ")
       .replace(Regex("[^a-z0-9]+"), " ")
@@ -237,9 +246,8 @@ object TorrentMetadataParser {
   }
 
   fun areFallbackSizesCompatible(sizeA: Long?, sizeB: Long?): Boolean {
-    if (sizeA == null && sizeB == null) return true
     if (sizeA == null || sizeB == null) return false
-    if (sizeA <= 0L || sizeB <= 0L) return sizeA == sizeB
+    if (sizeA <= 0L || sizeB <= 0L) return false
     val max = maxOf(sizeA, sizeB).toDouble()
     val diff = kotlin.math.abs(sizeA - sizeB).toDouble()
     return (diff / max) <= 0.12

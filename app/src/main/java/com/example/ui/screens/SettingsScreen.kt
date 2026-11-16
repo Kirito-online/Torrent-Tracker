@@ -118,6 +118,8 @@ fun SettingsScreen(
   onClearImageCache: () -> Unit,
   onClearSearchHistory: () -> Unit,
   onClearTempCache: () -> Unit,
+  onClearCookies: () -> Unit = {},
+  onBuildDiagnosticReport: suspend () -> String = { "" },
   onBuildBackupJson: suspend (BackupSelection) -> String = { "{}" },
   onLoadImportJson: (String) -> Unit = {},
   onConfirmRestoreBackup: (BackupSelection, RestoreMode) -> Unit = { _, _ -> },
@@ -176,6 +178,26 @@ fun SettingsScreen(
         onLoadImportJson(jsonText)
       }.onFailure { err ->
         onBackupFeedback("Could not read backup: ${err.localizedMessage ?: "I/O error"}")
+      }
+    }
+  }
+
+  val createDiagnosticReportLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("text/plain")
+  ) { uri: Uri? ->
+    if (uri == null) return@rememberLauncherForActivityResult
+    scope.launch {
+      runCatching {
+        val reportText = onBuildDiagnosticReport()
+        withContext(Dispatchers.IO) {
+          context.contentResolver.openOutputStream(uri)?.use { out ->
+            out.write(reportText.toByteArray(Charsets.UTF_8))
+          } ?: error("Unable to open output file")
+        }
+      }.onSuccess {
+        onBackupFeedback("Diagnostic report exported (cookies excluded)")
+      }.onFailure { err ->
+        onBackupFeedback("Diagnostic export failed: ${err.localizedMessage ?: "I/O error"}")
       }
     }
   }
@@ -347,7 +369,7 @@ fun SettingsScreen(
 
       SettingsSwitchRow(
         title = "Prefer HTTPS & warn on HTTP",
-        subtitle = "Show security warning before saving unencrypted HTTP sources",
+        subtitle = "Warn before saving http:// URLs; never bypasses per-source HTTP permission or OS security policy",
         checked = preferences.preferHttps,
         onCheckedChange = onPreferHttpsChanged
       )
@@ -389,6 +411,21 @@ fun SettingsScreen(
         }
         Spacer(Modifier.width(6.dp))
         Text("Run Source Connection Diagnostics")
+      }
+
+      Spacer(Modifier.height(6.dp))
+      OutlinedButton(
+        onClick = {
+          val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+          createDiagnosticReportLauncher.launch("torrent-tracker-diagnostics-$stamp.txt")
+        },
+        modifier = Modifier
+          .fillMaxWidth()
+          .testTag("export_diagnostics_button")
+      ) {
+        Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Export Diagnostic Report (Zero Cookies)")
       }
 
       if (diagnosticsResults.isNotEmpty()) {
@@ -465,6 +502,18 @@ fun SettingsScreen(
         OutlinedButton(onClick = onClearTempCache, modifier = Modifier.weight(1f)) {
           Text("Temp Cache", style = MaterialTheme.typography.labelSmall)
         }
+      }
+
+      Spacer(Modifier.height(6.dp))
+      OutlinedButton(
+        onClick = onClearCookies,
+        modifier = Modifier
+          .fillMaxWidth()
+          .testTag("clear_cookies_button")
+      ) {
+        Icon(Icons.Filled.CleaningServices, null, modifier = Modifier.size(15.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Clear Verification & Session Cookies", style = MaterialTheme.typography.labelSmall)
       }
 
       HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.outlineVariant)

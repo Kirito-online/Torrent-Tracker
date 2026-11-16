@@ -167,19 +167,37 @@ fun SourceRepairScreen(
             .border(0.5.dp, statusColor, RoundedCornerShape(10.dp))
             .padding(12.dp)
         ) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(statusIcon, null, tint = statusColor, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Diagnostic Summary", style = MaterialTheme.typography.titleSmall, color = statusColor)
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Icon(statusIcon, null, tint = statusColor, modifier = Modifier.size(20.dp))
+              Spacer(Modifier.width(8.dp))
+              Text("Diagnostic Summary", style = MaterialTheme.typography.titleSmall, color = statusColor)
+            }
+            CompactLabelBadge(
+              text = report.verificationStage.label,
+              containerColor = statusColor.copy(alpha = 0.16f),
+              contentColor = statusColor
+            )
           }
           Spacer(Modifier.height(6.dp))
           Text(report.issueSummary, style = MaterialTheme.typography.bodyMedium)
           Spacer(Modifier.height(6.dp))
           Text(
-            "Domain reachable: ${if (report.domainReachable) "Yes" else "No"} · HTTP: ${report.statusCode ?: "N/A"}",
+            "Domain reachable: ${if (report.domainReachable) "Yes" else "No"} · HTTP: ${report.statusCode ?: "N/A"} · Extracted: ${report.extractedCount}",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
           )
+          if (report.testedUrl.isNotBlank()) {
+            Text(
+              "Tested URL: ${report.testedUrl}",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+          }
         }
 
         if (report.redirectChain.isNotEmpty()) {
@@ -312,13 +330,13 @@ fun SourceRepairScreen(
         Button(
           onClick = {
             val trimmed = manualUrl.trim()
-            if (trimmed.startsWith("http://", true) && preferHttps && !source.allowCleartextHttp) {
+            if (trimmed.startsWith("http://", true) && !source.allowCleartextHttp) {
               pendingManualHttpUrl = trimmed
             } else {
               val isHttp = trimmed.startsWith("http://", true)
               val updated = when (source.sourceType) {
-                SourceType.RSS_ATOM -> source.copy(feedUrl = trimmed, allowCleartextHttp = isHttp)
-                else -> source.copy(searchUrlTemplate = trimmed, allowCleartextHttp = isHttp)
+                SourceType.RSS_ATOM -> source.copy(feedUrl = trimmed, allowCleartextHttp = isHttp && source.allowCleartextHttp)
+                else -> source.copy(searchUrlTemplate = trimmed, allowCleartextHttp = isHttp && source.allowCleartextHttp)
               }
               onSaveSource(updated)
             }
@@ -408,7 +426,7 @@ private fun ReplacementCandidateCard(
     feedUrl = replacement.replacementFeedUrl ?: source.feedUrl,
     sourceType = replacement.detectedSourceType ?: source.sourceType,
     htmlSelectors = replacement.replacementHtmlSelectors ?: source.htmlSelectors,
-    allowCleartextHttp = candidateUrl.startsWith("http://", true) || source.allowCleartextHttp
+    allowCleartextHttp = source.allowCleartextHttp
   )
   Column(
     modifier = Modifier
@@ -429,7 +447,7 @@ private fun ReplacementCandidateCard(
         modifier = Modifier.weight(1f).padding(end = 8.dp)
       )
       CompactLabelBadge(
-        text = if (replacement.isVerified) "Verified" else "Unverified",
+        text = if (replacement.isVerified) "Verified · ${replacement.stage.label}" else "${replacement.stage.label} (Unverified)",
         containerColor = (if (replacement.isVerified) SeederGreen else WarningOrange).copy(alpha = 0.16f),
         contentColor = if (replacement.isVerified) SeederGreen else WarningOrange
       )

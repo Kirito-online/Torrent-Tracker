@@ -52,8 +52,11 @@ private data class SourcePageCursor(
   val nextPage: Int,
   val nextPageUrl: String?,
   val hasMore: Boolean,
-  val visitedUrls: Set<String>
+  val visitedUrls: Set<String>,
+  val consecutiveDuplicatePages: Int = 0
 )
+
+private const val MAX_CONSECUTIVE_DUPLICATE_PAGES = 2
 
 class SearchViewModel(
   private val repository: TorrentRepository,
@@ -147,7 +150,7 @@ class SearchViewModel(
       sourceCursors.forEach { (sourceId, cursor) ->
         if (cursor.hasMore && cursor.nextPage <= UnifiedSourceAdapter.MAX_PAGINATION_PAGES) {
           val nextUrl = cursor.nextPageUrl
-          if (nextUrl == null || !cursor.visitedUrls.contains(nextUrl)) {
+          if (nextUrl == null || !cursor.visitedUrls.contains(normalizePaginationUrl(nextUrl))) {
             put(sourceId, SourcePageRequest(sourceId = sourceId, page = cursor.nextPage, overrideUrl = nextUrl))
           }
         }
@@ -259,11 +262,21 @@ class SearchViewModel(
               }
 
               val visited = (prevCursor?.visitedUrls ?: emptySet()) +
-                listOfNotNull(event.requestUrl.takeIf { it.isNotBlank() })
-              val nextUrl = event.nextPageUrl?.takeIf { it.isNotBlank() && !visited.contains(it) }
+                listOfNotNull(event.requestUrl.takeIf { it.isNotBlank() }?.let(::normalizePaginationUrl))
+              val rawNextUrl = event.nextPageUrl?.trim()?.takeIf { it.isNotBlank() }
+              val normalizedNext = rawNextUrl?.let(::normalizePaginationUrl)
+              val nextUrl = if (normalizedNext != null && !visited.contains(normalizedNext)) rawNextUrl else null
+
+              val nextDupCount = if (newUniqueItems.isEmpty()) {
+                (prevCursor?.consecutiveDuplicatePages ?: 0) + 1
+              } else {
+                0
+              }
+
               val curPage = pageRequests[event.sourceId]?.page ?: page
+              val withinDuplicateBudget = newUniqueItems.isNotEmpty() || nextDupCount <= MAX_CONSECUTIVE_DUPLICATE_PAGES
               val sourceStillHasMore = event.hasMore &&
-                newUniqueItems.isNotEmpty() &&
+                withinDuplicateBudget &&
                 curPage < UnifiedSourceAdapter.MAX_PAGINATION_PAGES &&
                 (event.nextPageUrl == null || nextUrl != null)
 
@@ -271,7 +284,8 @@ class SearchViewModel(
                 nextPage = curPage + 1,
                 nextPageUrl = nextUrl,
                 hasMore = sourceStillHasMore,
-                visitedUrls = visited
+                visitedUrls = visited,
+                consecutiveDuplicatePages = nextDupCount
               )
 
               rawItems.update { existing ->
@@ -392,6 +406,19 @@ class SearchViewModel(
     return uiState.value.results.firstOrNull { it.id == id }
       ?: rawItems.value.firstOrNull { it.id == id }
       ?: repository.getFavoriteOrCachedItem(id)
+  }
+
+  private fun normalizePaginationUrl(url: String): String {
+    val trimmed = url.trim().substringBefore('#')
+    return runCatching {
+      val uri = java.net.URI(trimmed)
+      val scheme = uri.scheme?.lowercase().orEmpty()
+      val host = uri.host?.lowercase().orEmpty()
+      val port = if (uri.port > 0) ":${uri.port}" else ""
+      val path = uri.rawPath.orEmpty()
+      val query = uri.rawQuery?.let { "?$it" }.orEmpty()
+      if (scheme.isNotBlank() && host.isNotBlank()) "$scheme://$host$port$path$query" else trimmed
+    }.getOrDefault(trimmed)
   }
 
   class Factory(

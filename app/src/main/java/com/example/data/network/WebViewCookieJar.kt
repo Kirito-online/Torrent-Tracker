@@ -16,12 +16,11 @@ data class CookieSessionStatus(
 
 /**
  * Bridges OkHttp cookies with Android WebView CookieManager using strict domain,
- * path, expiry, and HTTPS-secure scoping so manual Cloudflare verification sessions
- * can be reused safely without leaking cookies across domains or over plain HTTP.
+ * host-only, path, expiry, and HTTPS-secure scoping so manual Cloudflare verification
+ * sessions can be reused safely without leaking cookies across domains or over plain HTTP.
  * Falls back gracefully to an in-memory store in JVM unit test environments.
  */
 class WebViewCookieJar : CookieJar {
-  // Keyed by normalized cookie key "${domain}|${path}|${name}"
   private val memoryStore = ConcurrentHashMap<String, Cookie>()
 
   private fun safeCookieManager(): CookieManager? = runCatching {
@@ -38,14 +37,12 @@ class WebViewCookieJar : CookieJar {
     }
     if (validCookies.isEmpty()) return
 
-    val nonExpiredCookies = mutableListOf<Cookie>()
     validCookies.forEach { cookie ->
       val key = cookieKey(cookie)
       if (cookie.expiresAt <= now) {
         memoryStore.remove(key)
       } else {
         memoryStore[key] = cookie
-        nonExpiredCookies.add(cookie)
       }
     }
 
@@ -70,43 +67,50 @@ class WebViewCookieJar : CookieJar {
     val now = System.currentTimeMillis()
     val result = linkedMapOf<String, Cookie>()
 
-    // 1. Load scoped, non-expired cookies from in-memory store (respects domain, path, and secure-over-HTTPS)
+    // 1. Load scoped, non-expired cookies from in-memory store (respects hostOnly/domain, path, and HTTPS-secure)
     val expiredKeys = mutableListOf<String>()
+    val blockedNamesOnHost = hashSetOf<String>()
     memoryStore.forEach { (key, cookie) ->
       if (cookie.expiresAt <= now) {
         expiredKeys.add(key)
       } else if (cookie.matches(url) && (!cookie.secure || url.isHttps)) {
         result[cookie.name] = cookie
+      } else if (cookie.matchesDomainOnly(url)) {
+        blockedNamesOnHost.add(cookie.name.lowercase())
       }
     }
     expiredKeys.forEach { memoryStore.remove(it) }
 
-    // 2. Merge scoped cookies from Android WebView CookieManager
-    val manager = safeCookieManager()
-    if (manager != null) {
-      val raw = runCatching { manager.getCookie(url.toString()) }.getOrNull()
-      if (!raw.isNullOrBlank()) {
-        raw.split(";").forEach { pair ->
-          val trimmed = pair.trim()
-          val eqIdx = trimmed.indexOf('=')
-          if (eqIdx > 0) {
-            val name = trimmed.substring(0, eqIdx).trim()
-            val value = trimmed.substring(eqIdx + 1).trim()
-            if (name.isNotBlank() && !result.containsKey(name)) {
-              // Enforce HTTPS for Cloudflare clearance/session cookies
-              val isSensitiveSessionCookie = isSensitiveSessionName(name)
-              if (isSensitiveSessionCookie && !url.isHttps) {
-                return@forEach
+    // 2. Bridge strictly scoped Cloudflare verification cookies from WebView CookieManager over HTTPS only.
+    // Because Android CookieManager.getCookie() does not expose Domain/Path/Expires attributes,
+    // we never widen scope (.domain() or broad '/'), never re-expose cookies whose stored path/https scope
+    // excludes this URL, and never persist bridged cookies into memoryStore.
+    if (url.isHttps) {
+      val manager = safeCookieManager()
+      if (manager != null) {
+        val raw = runCatching { manager.getCookie(url.toString()) }.getOrNull()
+        if (!raw.isNullOrBlank()) {
+          val scopedPath = url.encodedPath.takeIf { it.startsWith("/") }.orEmpty().ifBlank { "/" }
+          raw.split(";").forEach { pair ->
+            val trimmed = pair.trim()
+            val eqIdx = trimmed.indexOf('=')
+            if (eqIdx > 0) {
+              val name = trimmed.substring(0, eqIdx).trim()
+              val value = trimmed.substring(eqIdx + 1).trim()
+              if (name.isNotBlank() &&
+                isCloudflareSessionCookie(name) &&
+                !result.containsKey(name) &&
+                !blockedNamesOnHost.contains(name.lowercase())
+              ) {
+                result[name] = Cookie.Builder()
+                  .name(name)
+                  .value(value)
+                  .hostOnlyDomain(url.host)
+                  .path(scopedPath)
+                  .secure()
+                  .httpOnly()
+                  .build()
               }
-              val builder = Cookie.Builder()
-                .name(name)
-                .value(value)
-                .domain(url.host)
-                .path("/")
-              if (url.isHttps && isSensitiveSessionCookie) {
-                builder.secure()
-              }
-              result[name] = builder.build()
             }
           }
         }
@@ -135,11 +139,35 @@ class WebViewCookieJar : CookieJar {
     memoryStore.clear()
   }
 
-  private fun cookieKey(cookie: Cookie): String =
-    "${cookie.domain.lowercase()}|${cookie.path}|${cookie.name}"
+  fun clearAllCookies() {
+    memoryStore.clear()
+    safeCookieManager()?.let { manager ->
+      runCatching {
+        manager.removeAllCookies(null)
+        manager.flush()
+      }
+    }
+  }
 
-  private fun isSensitiveSessionName(name: String): Boolean {
+  private fun cookieKey(cookie: Cookie): String =
+    "${cookie.domain.lowercase()}|${if (cookie.hostOnly) "H" else "D"}|${cookie.path}|${cookie.name}"
+
+  private fun Cookie.matchesDomainOnly(url: HttpUrl): Boolean {
+    if (secure && !url.isHttps) return false
+    val host = url.host.lowercase()
+    val cookieDomain = domain.lowercase()
+    return if (hostOnly) {
+      host == cookieDomain
+    } else {
+      host == cookieDomain || host.endsWith(".$cookieDomain")
+    }
+  }
+
+  private fun isCloudflareSessionCookie(name: String): Boolean {
     val lower = name.lowercase()
-    return lower == "cf_clearance" || lower.startsWith("__cf") || lower.startsWith("__host-") || lower.startsWith("__secure-")
+    return lower == "cf_clearance" ||
+      lower == "__cf_bm" ||
+      lower == "__cflb" ||
+      lower.startsWith("cf_chl_")
   }
 }

@@ -131,7 +131,8 @@ data class TorrentSourceOffer(
   val uploadDateText: String? = null,
   val uploadTimestamp: Long? = null,
   val uploader: String? = null,
-  val isSourceHealthy: Boolean = true
+  val isSourceHealthy: Boolean = true,
+  val sourceHealth: SourceHealth = SourceHealth.UNKNOWN
 ) {
   val hasMagnet: Boolean get() = !magnetLink.isNullOrBlank()
   val hasDirectTorrent: Boolean get() = !torrentFileUrl.isNullOrBlank()
@@ -179,7 +180,10 @@ data class TorrentItem(
       else -> null
     }
 
-  fun toPrimaryOffer(isSourceHealthy: Boolean = true): TorrentSourceOffer = TorrentSourceOffer(
+  fun toPrimaryOffer(
+    isSourceHealthy: Boolean = false,
+    sourceHealth: SourceHealth = SourceHealth.UNKNOWN
+  ): TorrentSourceOffer = TorrentSourceOffer(
     sourceId = sourceId,
     sourceName = sourceName,
     sourceUrl = sourceUrl,
@@ -192,7 +196,8 @@ data class TorrentItem(
     uploadDateText = uploadDateText,
     uploadTimestamp = uploadTimestamp,
     uploader = uploader,
-    isSourceHealthy = isSourceHealthy
+    isSourceHealthy = isSourceHealthy,
+    sourceHealth = sourceHealth
   )
 
   val allSourceOffers: List<TorrentSourceOffer>
@@ -317,6 +322,14 @@ sealed interface SourceProgressState {
   ) : SourceProgressState
 }
 
+enum class RepairVerificationStage(val label: String) {
+  UNREACHABLE("Unreachable"),
+  REACHABLE("Reachable"),
+  RECOGNIZED("Recognized"),
+  PARSED("Parsed"),
+  USABLE("Usable")
+}
+
 data class VerifiedReplacement(
   val label: String,
   val replacementBaseUrl: String,
@@ -326,7 +339,8 @@ data class VerifiedReplacement(
   val replacementHtmlSelectors: HtmlSelectorConfig? = null,
   val verificationSummary: String,
   val isVerified: Boolean = true,
-  val reason: String = ""
+  val reason: String = "",
+  val stage: RepairVerificationStage = if (isVerified) RepairVerificationStage.USABLE else RepairVerificationStage.RECOGNIZED
 )
 
 data class SourceDiagnosticReport(
@@ -341,7 +355,10 @@ data class SourceDiagnosticReport(
   val isSpaPage: Boolean = false,
   val issueSummary: String,
   val recommendedActions: List<String>,
-  val verifiedReplacements: List<VerifiedReplacement>
+  val verifiedReplacements: List<VerifiedReplacement>,
+  val verificationStage: RepairVerificationStage = RepairVerificationStage.UNREACHABLE,
+  val testedUrl: String = "",
+  val extractedCount: Int = 0
 )
 
 data class StorageUsageInfo(

@@ -7,6 +7,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.CacheControl
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -34,18 +36,21 @@ data class HttpFetchResult(
 
 class TorrentHttpClient(
   val cookieJar: WebViewCookieJar = WebViewCookieJar(),
-  private val maxResponseBytes: Long = DEFAULT_MAX_RESPONSE_BYTES
+  private val maxResponseBytes: Long = DEFAULT_MAX_RESPONSE_BYTES,
+  private val clientCustomizer: ((OkHttpClient.Builder) -> Unit)? = null
 ) {
   companion object {
     const val DEFAULT_USER_AGENT =
       "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     const val DEFAULT_MAX_RESPONSE_BYTES = 4L * 1024L * 1024L // 4 MB safety limit
+    const val MAX_REDIRECT_HOPS = 5
   }
 
   private val baseClient: OkHttpClient = OkHttpClient.Builder()
+    .apply { clientCustomizer?.invoke(this) }
     .cookieJar(cookieJar)
-    .followRedirects(true)
-    .followSslRedirects(true)
+    .followRedirects(false)
+    .followSslRedirects(false)
     .retryOnConnectionFailure(true)
     .connectTimeout(12, TimeUnit.SECONDS)
     .readTimeout(12, TimeUnit.SECONDS)
@@ -58,7 +63,7 @@ class TorrentHttpClient(
     followRedirects: Boolean = true,
     acceptHeader: String = "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
     forceNetwork: Boolean = false,
-    allowCleartext: Boolean = true
+    allowCleartext: Boolean = false
   ): HttpFetchResult = withContext(Dispatchers.IO) {
     val normalizedUrl = url.trim()
     if (!normalizedUrl.startsWith("http://", ignoreCase = true) &&
@@ -76,7 +81,19 @@ class TorrentHttpClient(
       )
     }
 
-    if (!allowCleartext && normalizedUrl.startsWith("http://", ignoreCase = true)) {
+    val initialHttpUrl = normalizedUrl.toHttpUrlOrNull()
+      ?: return@withContext HttpFetchResult(
+        requestedUrl = url,
+        finalUrl = url,
+        statusCode = null,
+        body = null,
+        contentType = null,
+        redirectChain = emptyList(),
+        isCloudflareChallenge = false,
+        errorMessage = "Invalid URL syntax."
+      )
+
+    if (!allowCleartext && !initialHttpUrl.isHttps) {
       return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
         finalUrl = normalizedUrl,
@@ -85,7 +102,7 @@ class TorrentHttpClient(
         contentType = null,
         redirectChain = emptyList(),
         isCloudflareChallenge = false,
-        errorMessage = "Unencrypted HTTP blocked (HTTPS is preferred). Enable HTTP confirmation in Edit Source if required."
+        errorMessage = "Unencrypted HTTP blocked (HTTPS-only by default). Confirm HTTP permission in Edit Source if required."
       )
     }
 
@@ -93,126 +110,193 @@ class TorrentHttpClient(
     val client = baseClient.newBuilder()
       .connectTimeout(clampedTimeout, TimeUnit.SECONDS)
       .readTimeout(clampedTimeout, TimeUnit.SECONDS)
-      .followRedirects(followRedirects)
-      .followSslRedirects(followRedirects)
+      .followRedirects(false)
+      .followSslRedirects(false)
       .build()
 
-    val requestBuilder = Request.Builder()
-      .url(normalizedUrl)
-      .header("User-Agent", DEFAULT_USER_AGENT)
-      .header("Accept", acceptHeader)
-      .header("Accept-Language", "en-US,en;q=0.9")
-      .get()
-
-    if (forceNetwork) {
-      requestBuilder.cacheControl(CacheControl.FORCE_NETWORK)
-      requestBuilder.header("Pragma", "no-cache")
-    }
-
-    val request = requestBuilder.build()
+    val chain = mutableListOf<String>()
+    val visitedUrls = linkedSetOf(initialHttpUrl.toString())
+    var currentHttpUrl: HttpUrl = initialHttpUrl
 
     try {
-      executeCallCancellable(client.newCall(request)).use { response ->
-        val chain = mutableListOf<String>()
-        var prior = response.priorResponse
-        while (prior != null) {
-          val location = prior.header("Location")
-          if (!location.isNullOrBlank()) {
-            chain.add(0, "${prior.code} -> $location")
+      var hop = 0
+      while (true) {
+        val requestBuilder = Request.Builder()
+          .url(currentHttpUrl)
+          .header("User-Agent", DEFAULT_USER_AGENT)
+          .header("Accept", acceptHeader)
+          .header("Accept-Language", "en-US,en;q=0.9")
+          .get()
+
+        if (forceNetwork) {
+          requestBuilder.cacheControl(CacheControl.FORCE_NETWORK)
+          requestBuilder.header("Pragma", "no-cache")
+        }
+
+        val request = requestBuilder.build()
+        val response = executeCallCancellable(client.newCall(request))
+
+        var shouldContinueRedirect = false
+        var nextHopUrl: HttpUrl? = null
+        var earlyReturn: HttpFetchResult? = null
+
+        response.use { res ->
+          val finalUrlStr = res.request.url.toString()
+          val locationHeader = res.header("Location")?.trim()
+
+          if (res.code in 300..399 && !locationHeader.isNullOrBlank()) {
+            chain.add("${res.code} -> $locationHeader")
+            val resolvedNext = res.request.url.resolve(locationHeader)
+
+            if (resolvedNext == null) {
+              earlyReturn = HttpFetchResult(
+                requestedUrl = normalizedUrl,
+                finalUrl = finalUrlStr,
+                statusCode = null,
+                body = null,
+                contentType = null,
+                redirectChain = chain,
+                isCloudflareChallenge = false,
+                errorMessage = "Blocked redirect to invalid or unsupported URL scheme."
+              )
+            } else if (!allowCleartext && !resolvedNext.isHttps) {
+              val downgradeLabel = if (res.request.url.isHttps) {
+                "Blocked HTTPS-to-HTTP downgrade redirect to $resolvedNext."
+              } else {
+                "Blocked redirect to unencrypted HTTP ($resolvedNext)."
+              }
+              earlyReturn = HttpFetchResult(
+                requestedUrl = normalizedUrl,
+                finalUrl = resolvedNext.toString(),
+                statusCode = null,
+                body = null,
+                contentType = null,
+                redirectChain = chain,
+                isCloudflareChallenge = false,
+                errorMessage = downgradeLabel
+              )
+            } else if (followRedirects) {
+              if (!visitedUrls.add(resolvedNext.toString())) {
+                earlyReturn = HttpFetchResult(
+                  requestedUrl = normalizedUrl,
+                  finalUrl = resolvedNext.toString(),
+                  statusCode = null,
+                  body = null,
+                  contentType = null,
+                  redirectChain = chain,
+                  isCloudflareChallenge = false,
+                  errorMessage = "Redirect loop detected."
+                )
+              } else if (hop >= MAX_REDIRECT_HOPS) {
+                earlyReturn = HttpFetchResult(
+                  requestedUrl = normalizedUrl,
+                  finalUrl = resolvedNext.toString(),
+                  statusCode = null,
+                  body = null,
+                  contentType = null,
+                  redirectChain = chain,
+                  isCloudflareChallenge = false,
+                  errorMessage = "Too many redirects (limit $MAX_REDIRECT_HOPS)."
+                )
+              } else {
+                shouldContinueRedirect = true
+                nextHopUrl = resolvedNext
+              }
+            }
           }
-          prior = prior.priorResponse
-        }
-        val directLocation = response.header("Location")
-        if (response.code in 300..399 && !directLocation.isNullOrBlank()) {
-          chain.add("${response.code} -> $directLocation")
-        }
 
-        val finalUrl = response.request.url.toString()
-        if (!allowCleartext && finalUrl.startsWith("http://", ignoreCase = true)) {
-          return@withContext HttpFetchResult(
-            requestedUrl = normalizedUrl,
-            finalUrl = finalUrl,
-            statusCode = null,
-            body = null,
-            contentType = null,
-            redirectChain = chain,
-            isCloudflareChallenge = false,
-            errorMessage = "Redirected to unencrypted HTTP, which is blocked when HTTPS is enforced."
-          )
-        }
+          if (earlyReturn != null) {
+            return@withContext earlyReturn!!
+          }
+          if (!shouldContinueRedirect) {
+            val bodyRead = readBoundedBody(res.body, maxResponseBytes)
+            if (bodyRead.exceededLimit) {
+              return@withContext HttpFetchResult(
+                requestedUrl = normalizedUrl,
+                finalUrl = finalUrlStr,
+                statusCode = res.code,
+                body = null,
+                contentType = res.header("Content-Type"),
+                redirectChain = chain,
+                isCloudflareChallenge = false,
+                errorMessage = "Response exceeded ${maxResponseBytes / (1024 * 1024)} MB safety limit."
+              )
+            }
 
-        val bodyRead = readBoundedBody(response.body, maxResponseBytes)
-        if (bodyRead.exceededLimit) {
-          return@withContext HttpFetchResult(
-            requestedUrl = normalizedUrl,
-            finalUrl = finalUrl,
-            statusCode = response.code,
-            body = null,
-            contentType = response.header("Content-Type"),
-            redirectChain = chain,
-            isCloudflareChallenge = false,
-            errorMessage = "Response exceeded ${maxResponseBytes / (1024 * 1024)} MB safety limit."
-          )
-        }
+            val bodyText = bodyRead.text
+            val contentType = res.header("Content-Type")
+            val cfRay = res.header("cf-ray")
+            val cfMitigated = res.header("cf-mitigated")
+            val server = res.header("Server").orEmpty()
+            val isCf = isCloudflareResponse(
+              statusCode = res.code,
+              cfMitigated = cfMitigated,
+              cfRay = cfRay,
+              server = server,
+              body = bodyText
+            )
 
-        val bodyText = bodyRead.text
-        val contentType = response.header("Content-Type")
-        val cfRay = response.header("cf-ray")
-        val cfMitigated = response.header("cf-mitigated")
-        val server = response.header("Server").orEmpty()
-        val isCf = isCloudflareResponse(
-          statusCode = response.code,
-          cfMitigated = cfMitigated,
-          cfRay = cfRay,
-          server = server,
-          body = bodyText
-        )
+            val err = when {
+              isCf -> "Cloudflare browser verification required (HTTP ${res.code})"
+              !res.isSuccessful && res.code in 300..399 ->
+                "Redirected (HTTP ${res.code}) to ${locationHeader ?: finalUrlStr}"
+              !res.isSuccessful -> "HTTP ${res.code} ${res.message}".trim()
+              bodyText.isNullOrBlank() -> "Empty response body"
+              else -> null
+            }
 
-        val err = when {
-          isCf -> "Cloudflare browser verification required (HTTP ${response.code})"
-          !response.isSuccessful && response.code in 300..399 ->
-            "Redirected (HTTP ${response.code}) to ${directLocation ?: finalUrl}"
-          !response.isSuccessful -> "HTTP ${response.code} ${response.message}".trim()
-          bodyText.isNullOrBlank() -> "Empty response body"
-          else -> null
+            return@withContext HttpFetchResult(
+              requestedUrl = normalizedUrl,
+              finalUrl = finalUrlStr,
+              statusCode = res.code,
+              body = bodyText,
+              contentType = contentType,
+              redirectChain = chain,
+              isCloudflareChallenge = isCf,
+              errorMessage = err
+            )
+          }
         }
 
-        HttpFetchResult(
-          requestedUrl = normalizedUrl,
-          finalUrl = finalUrl,
-          statusCode = response.code,
-          body = bodyText,
-          contentType = contentType,
-          redirectChain = chain,
-          isCloudflareChallenge = isCf,
-          errorMessage = err
-        )
+        currentHttpUrl = nextHopUrl!!
+        hop++
       }
     } catch (ce: CancellationException) {
       throw ce
     } catch (e: IOException) {
-      HttpFetchResult(
+      return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
-        finalUrl = normalizedUrl,
+        finalUrl = currentHttpUrl.toString(),
         statusCode = null,
         body = null,
         contentType = null,
-        redirectChain = emptyList(),
+        redirectChain = chain,
         isCloudflareChallenge = false,
         errorMessage = e.localizedMessage ?: "Network connection failed"
       )
     } catch (e: Exception) {
-      HttpFetchResult(
+      return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
-        finalUrl = normalizedUrl,
+        finalUrl = currentHttpUrl.toString(),
         statusCode = null,
         body = null,
         contentType = null,
-        redirectChain = emptyList(),
+        redirectChain = chain,
         isCloudflareChallenge = false,
         errorMessage = e.localizedMessage ?: "Unexpected request error"
       )
     }
+    @Suppress("UNREACHABLE_CODE")
+    HttpFetchResult(
+      requestedUrl = normalizedUrl,
+      finalUrl = currentHttpUrl.toString(),
+      statusCode = null,
+      body = null,
+      contentType = null,
+      redirectChain = chain,
+      isCloudflareChallenge = false,
+      errorMessage = "Request terminated unexpectedly"
+    )
   }
 
   private suspend fun executeCallCancellable(call: Call): Response =

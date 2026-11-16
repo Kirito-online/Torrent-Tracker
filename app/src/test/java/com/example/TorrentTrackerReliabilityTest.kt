@@ -20,6 +20,7 @@ import com.example.domain.model.BackupSelection
 import com.example.domain.model.DisplayDensity
 import com.example.domain.model.HtmlSelectorConfig
 import com.example.domain.model.JsonMappingConfig
+import com.example.domain.model.RepairVerificationStage
 import com.example.domain.model.RestoreMode
 import com.example.domain.model.SearchFilterState
 import com.example.domain.model.SortOption
@@ -42,6 +43,10 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -444,16 +449,19 @@ class TorrentTrackerReliabilityTest {
     assertEquals(1, parsed.sources.size)
     assertEquals(1, parsed.favorites.size)
 
-    // Mutate DB: add srcB and fav2, remove fav1 before testing MERGE vs REPLACE
+    // Mutate DB: alter srcA locally, add srcB and fav2, remove fav1 before testing MERGE vs REPLACE
+    repo.saveSource(srcA.copy(name = "Mutated Source A"), preservePreviousSnapshot = false)
     repo.saveSource(srcB, preservePreviousSnapshot = false)
     repo.toggleFavorite(fav1) // removes fav1
     repo.toggleFavorite(fav2) // adds fav2
 
-    // MERGE keeps srcB & fav2 while restoring fav1
+    // MERGE updates matching IDs (restoring srcA name) while preserving unrelated srcB & fav2
     val mergeSummary = repo.restoreBackup(parsed, BackupSelection(true, true, true, false), RestoreMode.MERGE, prefsRepo)
-    assertEquals(0, mergeSummary.sourcesRestored) // srcA already existed
-    assertEquals(1, mergeSummary.favoritesRestored) // fav1 inserted
-    assertTrue(repo.observeSources().first().map { it.id }.containsAll(listOf("s_a", "s_b")))
+    assertEquals(1, mergeSummary.sourcesRestored) // srcA upserted/updated
+    assertEquals(1, mergeSummary.favoritesRestored) // fav1 upserted
+    val mergedSources = repo.observeSources().first()
+    assertTrue(mergedSources.map { it.id }.containsAll(listOf("s_a", "s_b")))
+    assertEquals("Source A", mergedSources.first { it.id == "s_a" }.name)
     assertEquals(2, repo.observeFavorites().first().size)
 
     // REPLACE wipes extra rows so DB matches backup exactly
@@ -739,5 +747,307 @@ class TorrentTrackerReliabilityTest {
     assertEquals(6, diagResults.size)
     assertTrue(diagResults.all { it.second is SourceProgressState.Success })
     assertTrue("Expected max concurrent <= 2, saw ${maxObserved.get()}", maxObserved.get() <= 2)
+  }
+
+  // 8. Global preferHttps=false must NOT unlock HTTP, and HTTPS->HTTP downgrade redirects are blocked BEFORE connecting
+  @Test
+  fun `global preferHttps false does not unlock http sources and downgrade redirect never connects to http target`() = runBlocking {
+    val httpTargetHits = AtomicInteger(0)
+    val httpBase = startLocalServer { _ ->
+      httpTargetHits.incrementAndGet()
+      Triple(200, "application/json", """[{"title":"Should Never Load","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]""")
+    }
+
+    // Intercept https://secure.test/start and emit a 302 Location -> http://127.0.0.1:<port>/downgrade
+    val redirectClient = TorrentHttpClient(
+      WebViewCookieJar(),
+      clientCustomizer = { builder ->
+        builder.addInterceptor { chain ->
+          val req = chain.request()
+          if (req.url.host == "secure.test") {
+            Response.Builder()
+              .request(req)
+              .protocol(Protocol.HTTP_1_1)
+              .code(302)
+              .message("Found")
+              .header("Location", "$httpBase/downgrade")
+              .body("".toResponseBody("text/plain".toMediaType()))
+              .build()
+          } else {
+            chain.proceed(req)
+          }
+        }
+      }
+    )
+
+    val downgradeRes = redirectClient.fetch("https://secure.test/start", allowCleartext = false)
+    assertFalse(downgradeRes.isSuccessful)
+    assertTrue(downgradeRes.errorMessage?.contains("downgrade", ignoreCase = true) == true)
+    assertEquals(0, httpTargetHits.get())
+
+    // Even when global preferHttps preference is FALSE, a source with allowCleartextHttp = false MUST stay blocked
+    val blockedSrc = TorrentSource(
+      id = "unapproved_http",
+      name = "Unapproved HTTP",
+      baseUrl = httpBase,
+      searchUrlTemplate = "$httpBase/search?q={query}",
+      sourceType = SourceType.JSON_API,
+      allowCleartextHttp = false,
+      jsonMapping = JsonMappingConfig(itemsPath = "", titleField = "title", infoHashField = "hash")
+    )
+    val testRes = repo.testSingleSource(blockedSrc, timeoutSeconds = 5, preferHttps = false)
+    assertTrue(testRes is SourceProgressState.Error)
+    assertEquals(0, httpTargetHits.get())
+  }
+
+  // 9. Backup validation rejects duplicate IDs, bad URLs, broken collection references, and resets HTTP permission on import
+  @Test
+  fun `backup validation rejects malformed entries and resets cleartext permission on import`() = runBlocking {
+    val dupIdJson = """
+      {
+        "schemaVersion": 1,
+        "exportedAt": 1700000000000,
+        "sources": [
+          {"id":"s1","name":"One","baseUrl":"https://one.example","searchUrlTemplate":"https://one.example/q={query}","sourceType":"RSS_ATOM"},
+          {"id":"s1","name":"Two","baseUrl":"https://two.example","searchUrlTemplate":"https://two.example/q={query}","sourceType":"RSS_ATOM"}
+        ]
+      }
+    """.trimIndent()
+    assertTrue(repo.parseAndValidateBackup(dupIdJson).isFailure)
+
+    val badSchemeJson = """
+      {
+        "schemaVersion": 1,
+        "exportedAt": 1700000000000,
+        "sources": [
+          {"id":"s1","name":"Bad","baseUrl":"javascript:alert(1)","searchUrlTemplate":"","sourceType":"RSS_ATOM"}
+        ]
+      }
+    """.trimIndent()
+    assertTrue(repo.parseAndValidateBackup(badSchemeJson).isFailure)
+
+    val brokenCollectionJson = """
+      {
+        "schemaVersion": 1,
+        "exportedAt": 1700000000000,
+        "collections": [],
+        "favorites": [
+          {"id":"f1","title":"Movie","category":"MOVIES","collectionId":"missing_col","sourceId":"s1","sourceName":"S1"}
+        ]
+      }
+    """.trimIndent()
+    assertTrue(repo.parseAndValidateBackup(brokenCollectionJson).isFailure)
+
+    val httpBackupJson = """
+      {
+        "schemaVersion": 1,
+        "exportedAt": 1700000000000,
+        "sources": [
+          {"id":"http_imp","name":"Imported HTTP","baseUrl":"http://legacy.example","searchUrlTemplate":"http://legacy.example/q={query}","sourceType":"RSS_ATOM","allowCleartextHttp":true}
+        ]
+      }
+    """.trimIndent()
+    val parsedHttp = repo.parseAndValidateBackup(httpBackupJson).getOrThrow()
+    repo.restoreBackup(parsedHttp, BackupSelection(true, false, false, false), RestoreMode.REPLACE, prefsRepo)
+    val importedSrc = repo.getSourceById("http_imp")!!
+    assertFalse("Imported HTTP source must require fresh confirmation", importedSrc.allowCleartextHttp)
+  }
+
+  // 10. Pagination handles relative URLs & continues through consecutive duplicate-only pages
+  @Test
+  fun `pagination resolves relative next links and advances across consecutive duplicate pages`() = runBlocking {
+    val dupHash = "abababababababababababababababababababab"
+    val newHash = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    val baseUrl = startLocalServer { path ->
+      when (path) {
+        "/s/search?q=ubuntu" -> Triple(
+          200,
+          "application/json",
+          """{"next":"?q=ubuntu&page=2","results":[{"title":"Ubuntu 24.04","hash":"$dupHash","seeds":50}]}"""
+        )
+        "/s/search?q=ubuntu&page=2" -> Triple(
+          200,
+          "application/json",
+          """{"next":"page/3","results":[{"title":"Ubuntu 24.04","hash":"$dupHash","seeds":50}]}"""
+        )
+        "/s/page/3" -> Triple(
+          200,
+          "application/json",
+          """{"next":null,"results":[{"title":"Ubuntu 24.10","hash":"$newHash","seeds":90}]}"""
+        )
+        else -> Triple(404, "text/plain", "Not found: $path")
+      }
+    }
+
+    val adapter = UnifiedSourceAdapter(httpClient)
+    val src = TorrentSource(
+      id = "rel_json",
+      name = "RelativeJSON",
+      baseUrl = baseUrl,
+      searchUrlTemplate = "$baseUrl/s/search?q={query}",
+      sourceType = SourceType.JSON_API,
+      allowCleartextHttp = true,
+      jsonMapping = JsonMappingConfig(itemsPath = "results", titleField = "title", infoHashField = "hash", seedersField = "seeds")
+    )
+    val p1 = adapter.fetchPage(src, "ubuntu", 1, 5, allowCleartext = true)
+    assertEquals("$baseUrl/s/search?q=ubuntu&page=2", p1.nextPageUrl)
+    val p2 = adapter.fetchPage(src, "ubuntu", 2, 5, overrideUrl = p1.nextPageUrl, allowCleartext = true)
+    assertEquals("$baseUrl/s/page/3", p2.nextPageUrl)
+
+    prefsRepo.updateAutoRefreshOnLaunch(false)
+    repo.ensureSeeded()
+    db.torrentSourceDao().getAll().forEach { db.torrentSourceDao().upsert(it.copy(enabled = false)) }
+    repo.saveSource(src, preservePreviousSnapshot = false)
+
+    val vm = SearchViewModel(repo, prefsRepo)
+    val job = launch { vm.uiState.collect {} }
+    try {
+      Shadows.shadowOf(Looper.getMainLooper()).idle()
+      vm.submitSearch("ubuntu")
+      repeat(50) {
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        if (!vm.uiState.value.isLoading && vm.uiState.value.results.isNotEmpty()) return@repeat
+        delay(30)
+      }
+      assertEquals(1, vm.uiState.value.results.size)
+      assertTrue(vm.uiState.value.hasMorePages)
+
+      // Page 2 only has duplicates of page 1, so Cursor still preserves nextPageUrl ("page/3")
+      vm.loadNextPage()
+      repeat(80) {
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        val st = vm.uiState.value
+        if (!st.isLoadingMore && st.currentPage >= 2) return@repeat
+        delay(30)
+      }
+      assertEquals(1, vm.uiState.value.results.size)
+      assertEquals(2, vm.uiState.value.currentPage)
+      assertTrue("Should still allow loading page 3 after 1 duplicate-only page", vm.uiState.value.hasMorePages)
+
+      // Page 3 adds the new item and reaches end
+      vm.loadNextPage()
+      repeat(80) {
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        val st = vm.uiState.value
+        if (!st.isLoadingMore && st.currentPage >= 3 && st.results.size >= 2) return@repeat
+        delay(30)
+      }
+      assertEquals(2, vm.uiState.value.results.size)
+      assertFalse(vm.uiState.value.hasMorePages)
+    } finally {
+      job.cancel()
+    }
+  }
+
+  // 11. Hashless unknown-size items don't collapse, ONLINE beats UNKNOWN, and preferred source offer persists
+  @Test
+  fun `unknown size does not merge hashless items online outranks unknown and preferred offer persists`() = runBlocking {
+    val noSize1 = sampleItem("ns1", "Linux Distro 2024 1080p", "s1", "S1", infoHash = null, sizeBytes = null, magnet = "magnet:?dn=a")
+    val noSize2 = sampleItem("ns2", "Linux Distro 2024 1080p", "s2", "S2", infoHash = null, sizeBytes = null, magnet = "magnet:?dn=b")
+    val groupedNoSize = repo.deduplicateAndFilter(listOf(noSize1, noSize2), emptySet(), SearchFilterState())
+    assertEquals(2, groupedNoSize.size)
+
+    val sharedHash = "efefefefefefefefefefefefefefefefefefefef"
+    val unknownHealthyOffer = sampleItem("u1", "Ubuntu ISO 2024 1080p", "s_unk", "UnknownSrc", infoHash = sharedHash, seeders = 500)
+    val verifiedOnlineOffer = sampleItem("u2", "Ubuntu ISO 2024 1080p", "s_on", "OnlineSrc", infoHash = sharedHash, seeders = 50)
+    val merged = repo.deduplicateAndFilter(
+      listOf(unknownHealthyOffer, verifiedOnlineOffer),
+      emptySet(),
+      SearchFilterState(),
+      mapOf("s_unk" to SourceHealth.UNKNOWN, "s_on" to SourceHealth.ONLINE)
+    )
+    assertEquals(1, merged.size)
+    assertEquals("OnlineSrc", merged.first().sourceName)
+
+    // Save favorite and update preferred source offer
+    val fav = merged.first()
+    assertTrue(repo.toggleFavorite(fav))
+    val altOffer = fav.allSourceOffers.first { it.sourceId == "s_unk" }
+    repo.updateFavoritePreferredOffer(fav.id, altOffer)
+    val reloadedFav = repo.observeFavorites().first().first()
+    assertEquals("UnknownSrc", reloadedFav.sourceName)
+    assertEquals("s_unk", reloadedFav.allSourceOffers.first().sourceId)
+  }
+
+  // 12. WebViewCookieJar hostOnly isolation, path scoping, and clearAllCookies
+  @Test
+  fun `cookie jar enforces hostOnly subdomain isolation path scoping and clearAllCookies`() {
+    val jar = WebViewCookieJar()
+    val apexUrl = "https://example.org/search".toHttpUrl()
+    val subUrl = "https://sub.example.org/search".toHttpUrl()
+    val otherPathUrl = "https://example.org/other".toHttpUrl()
+
+    val hostOnlyPathScoped = Cookie.Builder()
+      .name("__cf_bm")
+      .value("tok123")
+      .hostOnlyDomain("example.org")
+      .path("/search")
+      .expiresAt(System.currentTimeMillis() + 60_000L)
+      .secure()
+      .build()
+
+    jar.saveFromResponse(apexUrl, listOf(hostOnlyPathScoped))
+
+    assertEquals(1, jar.loadForRequest(apexUrl).size)
+    assertEquals(0, jar.loadForRequest(subUrl).size)
+    assertEquals(0, jar.loadForRequest(otherPathUrl).size)
+
+    jar.clearAllCookies()
+    assertEquals(0, jar.loadForRequest(apexUrl).size)
+  }
+
+  // 13. SourceRepairEngine classifies HTTP 200 with 0 items as PARSED / RECOGNIZED (never verified) & enforces allowCleartextHttp
+  @Test
+  fun `repair engine never verifies zero-item http 200 and reports verification stage plus safe diagnostics`() = runBlocking {
+    val baseUrl = startLocalServer { path ->
+      when (path) {
+        "/parsed-zero" -> Triple(200, "application/json", """{"results":[]}""")
+        "/missing-selector" -> Triple(200, "text/html", "<html><body><div>Empty shell</div></body></html>")
+        else -> Triple(200, "text/html", "<html><body>No feeds</body></html>")
+      }
+    }
+
+    val adapter = UnifiedSourceAdapter(httpClient)
+    val engine = SourceRepairEngine(httpClient, adapter)
+    val parsedZeroJsonSrc = TorrentSource(
+      id = "zero_parse",
+      name = "ZeroParse",
+      baseUrl = baseUrl,
+      searchUrlTemplate = "$baseUrl/parsed-zero",
+      sourceType = SourceType.JSON_API,
+      allowCleartextHttp = true,
+      jsonMapping = JsonMappingConfig(itemsPath = "results", titleField = "title", infoHashField = "hash")
+    )
+
+    val report = engine.diagnoseSource(parsedZeroJsonSrc, timeoutSeconds = 5)
+    assertEquals(RepairVerificationStage.PARSED, report.verificationStage)
+    assertTrue(report.parsingIssueDetected)
+    assertEquals(0, report.extractedCount)
+
+    val candidateRes = engine.testCandidateUrl("$baseUrl/parsed-zero", parsedZeroJsonSrc, timeoutSeconds = 5)
+    assertTrue("Expected Parsed Not Usable, got: $candidateRes", candidateRes.contains("Parsed · Not Usable", ignoreCase = true))
+
+    val htmlMissingSrc = TorrentSource(
+      id = "missing_sel",
+      name = "MissingSelector",
+      baseUrl = baseUrl,
+      searchUrlTemplate = "$baseUrl/missing-selector",
+      sourceType = SourceType.HTML_SELECTOR,
+      allowCleartextHttp = true,
+      htmlSelectors = HtmlSelectorConfig(itemContainer = "tr.missing", title = "a")
+    )
+    val recognizedRes = engine.testCandidateUrl("$baseUrl/missing-selector", htmlMissingSrc, timeoutSeconds = 5)
+    assertTrue("Expected Recognized Parse Failed, got: $recognizedRes", recognizedRes.contains("Recognized · Parse Failed", ignoreCase = true))
+
+    // Without allowCleartextHttp, testing HTTP candidate is blocked
+    val blockedRes = engine.testCandidateUrl("$baseUrl/parsed-zero", parsedZeroJsonSrc.copy(allowCleartextHttp = false), timeoutSeconds = 5)
+    assertTrue("Expected Unreachable/blocked message, got: $blockedRes", blockedRes.contains("Unreachable", ignoreCase = true))
+
+    // Diagnostic export contains source summary without any cookies
+    repo.saveSource(parsedZeroJsonSrc, preservePreviousSnapshot = false)
+    val diagText = repo.buildDiagnosticReportText("1.0")
+    assertTrue(diagText.contains("ZeroParse"))
+    assertTrue(diagText.contains("Cookies", ignoreCase = true))
+    assertFalse(diagText.contains("tok123"))
   }
 }

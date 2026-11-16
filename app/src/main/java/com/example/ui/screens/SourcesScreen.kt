@@ -733,16 +733,25 @@ private fun SourceRowItem(
         contentColor = MaterialTheme.colorScheme.onSurfaceVariant
       )
       val lastOk = source.lastSuccessAt?.let {
-        "Updated ${TorrentMetadataParser.formatRelativeDate(it, null)}"
+        "Synced ${TorrentMetadataParser.formatRelativeDate(it, null)}"
       } ?: "Not synced yet"
       CompactLabelBadge(
         text = lastOk,
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
         contentColor = MaterialTheme.colorScheme.onSurfaceVariant
       )
+      source.lastCheckedAt?.let { checked ->
+        if (source.lastSuccessAt == null || checked - (source.lastSuccessAt ?: 0L) > 60_000L) {
+          CompactLabelBadge(
+            text = "Checked ${TorrentMetadataParser.formatRelativeDate(checked, null)}",
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+        }
+      }
       if (!source.isHttps) {
         CompactLabelBadge(
-          text = "Insecure HTTP",
+          text = if (source.allowCleartextHttp) "HTTP Allowed" else "HTTP Blocked",
           containerColor = WarningOrange.copy(alpha = 0.16f),
           contentColor = WarningOrange
         )
@@ -856,7 +865,7 @@ internal fun SourceEditorSheet(
   val hasHttpUrl = baseUrl.trim().startsWith("http://", true) ||
     searchTemplate.trim().startsWith("http://", true) ||
     feedUrl.trim().startsWith("http://", true)
-  val isHttpWarning = preferHttps && hasHttpUrl
+  val isHttpWarning = hasHttpUrl
 
   fun buildDraft(): TorrentSource = initialSource.copy(
     name = name.trim().ifBlank { "Custom Source" },
@@ -864,7 +873,7 @@ internal fun SourceEditorSheet(
     searchUrlTemplate = searchTemplate.trim(),
     feedUrl = feedUrl.trim(),
     sourceType = sourceType,
-    allowCleartextHttp = hasHttpUrl && (acknowledgedHttpRisk || !preferHttps),
+    allowCleartextHttp = hasHttpUrl && acknowledgedHttpRisk,
     htmlSelectors = htmlCfg,
     jsonMapping = jsonCfg
   )
@@ -955,8 +964,11 @@ internal fun SourceEditorSheet(
           Icon(Icons.Filled.Warning, null, tint = WarningOrange, modifier = Modifier.size(18.dp))
           Spacer(Modifier.width(8.dp))
           Column(modifier = Modifier.weight(1f)) {
-            Text("Insecure HTTP URL detected", style = MaterialTheme.typography.labelLarge, color = WarningOrange)
-            Text("Traffic is unencrypted. Prefer HTTPS whenever supported.", style = MaterialTheme.typography.bodySmall)
+            Text("Unencrypted HTTP permission required", style = MaterialTheme.typography.labelLarge, color = WarningOrange)
+            Text(
+              "Cleartext HTTP is blocked by default. Saving explicitly authorizes HTTP for this source only.",
+              style = MaterialTheme.typography.bodySmall
+            )
           }
           TextButton(onClick = {
             baseUrl = baseUrl.replaceFirst("http://", "https://", true)
@@ -1086,9 +1098,11 @@ internal fun SourceEditorSheet(
   if (showHttpConfirmDialog) {
     AlertDialog(
       onDismissRequest = { showHttpConfirmDialog = false },
-      title = { Text("Insecure HTTP Source") },
+      title = { Text("Authorize Insecure HTTP?") },
       text = {
-        Text("This source uses unencrypted http:// instead of https://. Continue anyway?")
+        Text(
+          "This source uses unencrypted http:// instead of https://. Saving grants per-source cleartext HTTP permission for this source only. Continue?"
+        )
       },
       confirmButton = {
         TextButton(onClick = {
