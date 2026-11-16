@@ -1,5 +1,8 @@
 package com.example.data.parser
 
+import com.example.data.logging.ActivityCategory
+import com.example.data.logging.ActivityLogLevel
+import com.example.data.logging.ActivityLogger
 import com.example.data.network.HttpFetchResult
 import com.example.data.network.TorrentHttpClient
 import com.example.domain.model.RepairVerificationStage
@@ -12,7 +15,8 @@ import java.net.URI
 
 class SourceRepairEngine(
   private val httpClient: TorrentHttpClient,
-  private val adapter: UnifiedSourceAdapter
+  private val adapter: UnifiedSourceAdapter,
+  private val logger: ActivityLogger? = null
 ) {
 
   suspend fun diagnoseSource(source: TorrentSource, timeoutSeconds: Int = 10): SourceDiagnosticReport {
@@ -276,7 +280,7 @@ class SourceRepairEngine(
       }
     }
 
-    return SourceDiagnosticReport(
+    val report = SourceDiagnosticReport(
       source = source,
       checkedAt = checkedAt,
       domainReachable = domainReachable,
@@ -297,6 +301,18 @@ class SourceRepairEngine(
       testedUrl = testEndpoint,
       extractedCount = extractedCount
     )
+    val logLevel = when {
+      fullStage == RepairVerificationStage.USABLE -> ActivityLogLevel.INFO
+      fullStage == RepairVerificationStage.UNREACHABLE || isCloudflare -> ActivityLogLevel.ERROR
+      else -> ActivityLogLevel.WARN
+    }
+    logger?.log(
+      level = logLevel,
+      category = ActivityCategory.REPAIR,
+      action = "Diagnostic [${fullStage.label}]: ${source.name}",
+      detail = "Endpoint: $testEndpoint | HTTP ${report.statusCode ?: "N/A"} | Extracted: $extractedCount | $issueSummary"
+    )
+    return report
   }
 
   suspend fun testCandidateUrl(url: String, source: TorrentSource, timeoutSeconds: Int = 10): String {
@@ -309,12 +325,16 @@ class SourceRepairEngine(
       allowCleartext = allowHttp
     )
     if (probe.isCloudflareChallenge) {
-      return "[Reachable · Verification Required] Tested $testedUrl -> HTTP ${probe.statusCode}: Cloudflare challenge active."
+      val msg = "[Reachable · Verification Required] Tested $testedUrl -> HTTP ${probe.statusCode}: Cloudflare challenge active."
+      logger?.warn(ActivityCategory.REPAIR, "Candidate test hit Cloudflare: ${source.name}", msg)
+      return msg
     }
     if (!probe.isSuccessful || probe.body == null) {
       val reason = probe.errorMessage ?: "HTTP ${probe.statusCode ?: "N/A"}"
       val stageLabel = if (probe.statusCode != null) RepairVerificationStage.REACHABLE.label else RepairVerificationStage.UNREACHABLE.label
-      return "[$stageLabel] Tested $testedUrl -> $reason"
+      val msg = "[$stageLabel] Tested $testedUrl -> $reason"
+      logger?.error(ActivityCategory.REPAIR, "Candidate test failed: ${source.name}", msg)
+      return msg
     }
 
     val candidateSource = when (source.sourceType) {
@@ -325,7 +345,7 @@ class SourceRepairEngine(
     val stage = classifyStage(probe, parsed, candidateSource.sourceType)
     val finalLabel = probe.finalUrl.ifBlank { testedUrl }
 
-    return when (stage) {
+    val summary = when (stage) {
       RepairVerificationStage.USABLE ->
         "[Usable · Verified] Tested $testedUrl -> HTTP ${probe.statusCode} (final: $finalLabel): extracted ${parsed.items.size} entries."
       RepairVerificationStage.PARSED ->
@@ -335,6 +355,13 @@ class SourceRepairEngine(
       else ->
         "[Reachable · Unrecognized] Tested $testedUrl -> HTTP ${probe.statusCode} (final: $finalLabel): response does not match ${source.sourceType.label} format."
     }
+    logger?.log(
+      level = if (stage == RepairVerificationStage.USABLE) ActivityLogLevel.INFO else ActivityLogLevel.WARN,
+      category = ActivityCategory.REPAIR,
+      action = "Candidate test [${stage.label}]: ${source.name}",
+      detail = summary
+    )
+    return summary
   }
 
   private suspend fun verifyCandidateReplacement(

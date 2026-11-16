@@ -39,7 +39,11 @@ class MainActivity : ComponentActivity() {
         factory = FavoritesViewModel.Factory(container.torrentRepository)
       )
       val settingsVm: SettingsViewModel = viewModel(
-        factory = SettingsViewModel.Factory(container.preferencesRepository, container.torrentRepository)
+        factory = SettingsViewModel.Factory(
+          container.preferencesRepository,
+          container.torrentRepository,
+          container.activityLogger
+        )
       )
 
       val prefs by settingsVm.preferences.collectAsStateWithLifecycle()

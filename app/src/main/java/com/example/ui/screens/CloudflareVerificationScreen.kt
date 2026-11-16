@@ -3,7 +3,9 @@ package com.example.ui.screens
 import android.annotation.SuppressLint
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
@@ -60,7 +62,8 @@ fun CloudflareVerificationScreen(
   source: TorrentSource?,
   onBack: () -> Unit,
   onVerifyAndRetrySource: (String) -> Unit,
-  onFeedback: (String) -> Unit
+  onFeedback: (String) -> Unit,
+  onLogVerificationEvent: (isError: Boolean, action: String, detail: String) -> Unit = { _, _, _ -> }
 ) {
   val context = LocalContext.current
   val initialUrl = source?.baseUrl ?: "https://example.com"
@@ -148,7 +151,10 @@ fun CloudflareVerificationScreen(
           Button(
             onClick = {
               runCatching { CookieManager.getInstance().flush() }
-              source?.let { onVerifyAndRetrySource(it.id) }
+              source?.let {
+                onLogVerificationEvent(false, "Manual WebView verification retried", "Source: ${it.name} ($currentUrl)")
+                onVerifyAndRetrySource(it.id)
+              }
               onBack()
             },
             enabled = source != null,
@@ -202,6 +208,30 @@ fun CloudflareVerificationScreen(
               override fun onPageFinished(view: WebView?, url: String?) {
                 url?.let { currentUrl = it }
                 runCatching { CookieManager.getInstance().flush() }
+              }
+
+              override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                if (request?.isForMainFrame == true) {
+                  onLogVerificationEvent(
+                    true,
+                    "WebView page load error",
+                    "URL: ${request.url} | Code=${error?.errorCode} | ${error?.description}"
+                  )
+                }
+              }
+
+              override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: WebResourceResponse?
+              ) {
+                if (request?.isForMainFrame == true) {
+                  onLogVerificationEvent(
+                    true,
+                    "WebView HTTP error ${errorResponse?.statusCode}",
+                    "URL: ${request.url} | ${errorResponse?.reasonPhrase}"
+                  )
+                }
               }
             }
             loadUrl(initialUrl)

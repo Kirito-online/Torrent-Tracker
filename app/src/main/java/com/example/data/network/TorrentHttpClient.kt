@@ -1,5 +1,7 @@
 package com.example.data.network
 
+import com.example.data.logging.ActivityCategory
+import com.example.data.logging.ActivityLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -37,7 +39,8 @@ data class HttpFetchResult(
 class TorrentHttpClient(
   val cookieJar: WebViewCookieJar = WebViewCookieJar(),
   private val maxResponseBytes: Long = DEFAULT_MAX_RESPONSE_BYTES,
-  private val clientCustomizer: ((OkHttpClient.Builder) -> Unit)? = null
+  private val clientCustomizer: ((OkHttpClient.Builder) -> Unit)? = null,
+  private val logger: ActivityLogger? = null
 ) {
   companion object {
     const val DEFAULT_USER_AGENT =
@@ -69,6 +72,7 @@ class TorrentHttpClient(
     if (!normalizedUrl.startsWith("http://", ignoreCase = true) &&
       !normalizedUrl.startsWith("https://", ignoreCase = true)
     ) {
+      logger?.warn(ActivityCategory.NETWORK, "Rejected invalid URL scheme", normalizedUrl)
       return@withContext HttpFetchResult(
         requestedUrl = url,
         finalUrl = url,
@@ -82,18 +86,26 @@ class TorrentHttpClient(
     }
 
     val initialHttpUrl = normalizedUrl.toHttpUrlOrNull()
-      ?: return@withContext HttpFetchResult(
-        requestedUrl = url,
-        finalUrl = url,
-        statusCode = null,
-        body = null,
-        contentType = null,
-        redirectChain = emptyList(),
-        isCloudflareChallenge = false,
-        errorMessage = "Invalid URL syntax."
-      )
+      ?: run {
+        logger?.warn(ActivityCategory.NETWORK, "Rejected malformed URL", normalizedUrl)
+        return@withContext HttpFetchResult(
+          requestedUrl = url,
+          finalUrl = url,
+          statusCode = null,
+          body = null,
+          contentType = null,
+          redirectChain = emptyList(),
+          isCloudflareChallenge = false,
+          errorMessage = "Invalid URL syntax."
+        )
+      }
 
     if (!allowCleartext && !initialHttpUrl.isHttps) {
+      logger?.warn(
+        ActivityCategory.NETWORK,
+        "Blocked unencrypted HTTP request",
+        "Host: ${initialHttpUrl.host}; per-source cleartext HTTP permission is disabled."
+      )
       return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
         finalUrl = normalizedUrl,
@@ -149,6 +161,7 @@ class TorrentHttpClient(
             val resolvedNext = res.request.url.resolve(locationHeader)
 
             if (resolvedNext == null) {
+              logger?.error(ActivityCategory.NETWORK, "Blocked invalid redirect scheme", "$finalUrlStr -> $locationHeader")
               earlyReturn = HttpFetchResult(
                 requestedUrl = normalizedUrl,
                 finalUrl = finalUrlStr,
@@ -165,6 +178,7 @@ class TorrentHttpClient(
               } else {
                 "Blocked redirect to unencrypted HTTP ($resolvedNext)."
               }
+              logger?.error(ActivityCategory.NETWORK, "Blocked insecure redirect", "$finalUrlStr -> $resolvedNext")
               earlyReturn = HttpFetchResult(
                 requestedUrl = normalizedUrl,
                 finalUrl = resolvedNext.toString(),
@@ -177,6 +191,7 @@ class TorrentHttpClient(
               )
             } else if (followRedirects) {
               if (!visitedUrls.add(resolvedNext.toString())) {
+                logger?.error(ActivityCategory.NETWORK, "Redirect loop detected", chain.joinToString(" | "))
                 earlyReturn = HttpFetchResult(
                   requestedUrl = normalizedUrl,
                   finalUrl = resolvedNext.toString(),
@@ -188,6 +203,7 @@ class TorrentHttpClient(
                   errorMessage = "Redirect loop detected."
                 )
               } else if (hop >= MAX_REDIRECT_HOPS) {
+                logger?.error(ActivityCategory.NETWORK, "Redirect hop limit exceeded", "${chain.size} hops from $normalizedUrl")
                 earlyReturn = HttpFetchResult(
                   requestedUrl = normalizedUrl,
                   finalUrl = resolvedNext.toString(),
@@ -211,6 +227,11 @@ class TorrentHttpClient(
           if (!shouldContinueRedirect) {
             val bodyRead = readBoundedBody(res.body, maxResponseBytes)
             if (bodyRead.exceededLimit) {
+              logger?.error(
+                ActivityCategory.NETWORK,
+                "Response size limit exceeded",
+                "$finalUrlStr (HTTP ${res.code}) exceeded ${maxResponseBytes / (1024 * 1024)} MB"
+              )
               return@withContext HttpFetchResult(
                 requestedUrl = normalizedUrl,
                 finalUrl = finalUrlStr,
@@ -245,6 +266,16 @@ class TorrentHttpClient(
               else -> null
             }
 
+            when {
+              isCf -> logger?.warn(ActivityCategory.VERIFICATION, "Cloudflare challenge encountered", "HTTP ${res.code} at $finalUrlStr")
+              err != null -> logger?.error(ActivityCategory.NETWORK, "HTTP request failed", "$finalUrlStr -> $err")
+              else -> logger?.info(
+                ActivityCategory.NETWORK,
+                "HTTP ${res.code} ${res.request.url.host}",
+                "URL: $finalUrlStr${if (chain.isNotEmpty()) " (redirects: ${chain.size})" else ""}"
+              )
+            }
+
             return@withContext HttpFetchResult(
               requestedUrl = normalizedUrl,
               finalUrl = finalUrlStr,
@@ -264,6 +295,12 @@ class TorrentHttpClient(
     } catch (ce: CancellationException) {
       throw ce
     } catch (e: IOException) {
+      logger?.error(
+        ActivityCategory.NETWORK,
+        "Network I/O error: ${currentHttpUrl.host}",
+        "URL: $currentHttpUrl — ${e.localizedMessage ?: "Connection failed"}",
+        e
+      )
       return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
         finalUrl = currentHttpUrl.toString(),
@@ -275,6 +312,12 @@ class TorrentHttpClient(
         errorMessage = e.localizedMessage ?: "Network connection failed"
       )
     } catch (e: Exception) {
+      logger?.error(
+        ActivityCategory.NETWORK,
+        "Unexpected HTTP client exception",
+        "URL: $currentHttpUrl — ${e.localizedMessage ?: "Unexpected error"}",
+        e
+      )
       return@withContext HttpFetchResult(
         requestedUrl = normalizedUrl,
         finalUrl = currentHttpUrl.toString(),

@@ -293,7 +293,8 @@ data class UserPreferences(
   val autoRefreshOnLaunch: Boolean = true,
   val sourceTimeoutSeconds: Int = 12,
   val maxConcurrentSources: Int = 4,
-  val preferHttps: Boolean = true
+  val preferHttps: Boolean = true,
+  val activityLoggingEnabled: Boolean = false
 )
 
 data class FavoriteCollection(

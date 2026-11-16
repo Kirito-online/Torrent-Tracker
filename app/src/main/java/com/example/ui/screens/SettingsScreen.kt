@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CleaningServices
@@ -69,6 +70,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
+import com.example.data.logging.ActivityLogEntry
+import com.example.data.logging.ActivityLogLevel
 import com.example.data.parser.TorrentMetadataParser
 import com.example.domain.model.AccentColorOption
 import com.example.domain.model.BackupSelection
@@ -120,6 +123,11 @@ fun SettingsScreen(
   onClearTempCache: () -> Unit,
   onClearCookies: () -> Unit = {},
   onBuildDiagnosticReport: suspend () -> String = { "" },
+  activityLogs: List<ActivityLogEntry> = emptyList(),
+  onActivityLoggingChanged: (Boolean) -> Unit = {},
+  onOpenActivityLog: () -> Unit = {},
+  onBuildActivityLogText: () -> String = { "" },
+  onClearActivityLogs: () -> Unit = {},
   onBuildBackupJson: suspend (BackupSelection) -> String = { "{}" },
   onLoadImportJson: (String) -> Unit = {},
   onConfirmRestoreBackup: (BackupSelection, RestoreMode) -> Unit = { _, _ -> },
@@ -198,6 +206,26 @@ fun SettingsScreen(
         onBackupFeedback("Diagnostic report exported (cookies excluded)")
       }.onFailure { err ->
         onBackupFeedback("Diagnostic export failed: ${err.localizedMessage ?: "I/O error"}")
+      }
+    }
+  }
+
+  val createActivityLogLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("text/plain")
+  ) { uri: Uri? ->
+    if (uri == null) return@rememberLauncherForActivityResult
+    scope.launch {
+      runCatching {
+        val logText = onBuildActivityLogText()
+        withContext(Dispatchers.IO) {
+          context.contentResolver.openOutputStream(uri)?.use { out ->
+            out.write(logText.toByteArray(Charsets.UTF_8))
+          } ?: error("Unable to open output file")
+        }
+      }.onSuccess {
+        onBackupFeedback("Activity & error log exported")
+      }.onFailure { err ->
+        onBackupFeedback("Activity log export failed: ${err.localizedMessage ?: "I/O error"}")
       }
     }
   }
@@ -463,7 +491,59 @@ fun SettingsScreen(
 
       HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.outlineVariant)
 
-      // 4. Storage
+      // 4. Activity & Error Log
+      val errorCount = remember(activityLogs) { activityLogs.count { it.level == ActivityLogLevel.ERROR } }
+      SettingsSectionHeader("Activity & Error Log")
+      SettingsSwitchRow(
+        title = "Record activity & error log",
+        subtitle = "Capture searches, network/parser failures, repairs, backups, and crashes locally for debugging (cookies redacted)",
+        checked = preferences.activityLoggingEnabled,
+        onCheckedChange = onActivityLoggingChanged,
+        switchTag = "activity_logging_switch"
+      )
+      Text(
+        text = "Recorded: ${activityLogs.size} events · $errorCount errors",
+        style = MaterialTheme.typography.labelSmall,
+        color = if (errorCount > 0) ErrorRed else MaterialTheme.colorScheme.onSurfaceVariant
+      )
+      Spacer(Modifier.height(8.dp))
+      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(
+          onClick = onOpenActivityLog,
+          modifier = Modifier
+            .weight(1f)
+            .testTag("inspect_activity_log_button")
+        ) {
+          Icon(Icons.Filled.BugReport, null, modifier = Modifier.size(16.dp))
+          Spacer(Modifier.width(4.dp))
+          Text("Inspect", style = MaterialTheme.typography.labelMedium)
+        }
+        OutlinedButton(
+          onClick = {
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+            createActivityLogLauncher.launch("torrent-tracker-activity-log-$stamp.txt")
+          },
+          modifier = Modifier
+            .weight(1f)
+            .testTag("export_activity_log_button")
+        ) {
+          Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+          Spacer(Modifier.width(4.dp))
+          Text("Export", style = MaterialTheme.typography.labelMedium)
+        }
+        OutlinedButton(
+          onClick = onClearActivityLogs,
+          enabled = activityLogs.isNotEmpty(),
+          modifier = Modifier
+            .testTag("clear_activity_log_button")
+        ) {
+          Text("Clear", style = MaterialTheme.typography.labelMedium)
+        }
+      }
+
+      HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.outlineVariant)
+
+      // 5. Storage
       SettingsSectionHeader("Storage")
       Column(
         modifier = Modifier
@@ -800,7 +880,8 @@ private fun SettingsSwitchRow(
   title: String,
   subtitle: String,
   checked: Boolean,
-  onCheckedChange: (Boolean) -> Unit
+  onCheckedChange: (Boolean) -> Unit,
+  switchTag: String? = null
 ) {
   Row(
     modifier = Modifier
@@ -813,6 +894,10 @@ private fun SettingsSwitchRow(
       Text(title, style = MaterialTheme.typography.bodyMedium)
       Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    Switch(checked = checked, onCheckedChange = onCheckedChange)
+    Switch(
+      checked = checked,
+      onCheckedChange = onCheckedChange,
+      modifier = if (switchTag != null) Modifier.testTag(switchTag) else Modifier
+    )
   }
 }

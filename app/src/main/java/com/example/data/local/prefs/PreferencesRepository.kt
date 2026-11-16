@@ -32,6 +32,7 @@ class PreferencesRepository(private val context: Context) {
     val SOURCE_TIMEOUT_SECONDS = intPreferencesKey("source_timeout_seconds")
     val MAX_CONCURRENT_SOURCES = intPreferencesKey("max_concurrent_sources")
     val PREFER_HTTPS = booleanPreferencesKey("prefer_https")
+    val ACTIVITY_LOGGING_ENABLED = booleanPreferencesKey("activity_logging_enabled")
   }
 
   val preferencesFlow: Flow<UserPreferences> = context.dataStore.data.map { prefs ->
@@ -50,7 +51,8 @@ class PreferencesRepository(private val context: Context) {
       autoRefreshOnLaunch = prefs[Keys.AUTO_REFRESH_ON_LAUNCH] ?: true,
       sourceTimeoutSeconds = prefs[Keys.SOURCE_TIMEOUT_SECONDS] ?: 12,
       maxConcurrentSources = prefs[Keys.MAX_CONCURRENT_SOURCES] ?: 4,
-      preferHttps = prefs[Keys.PREFER_HTTPS] ?: true
+      preferHttps = prefs[Keys.PREFER_HTTPS] ?: true,
+      activityLoggingEnabled = prefs[Keys.ACTIVITY_LOGGING_ENABLED] ?: false
     )
   }
 
@@ -94,6 +96,10 @@ class PreferencesRepository(private val context: Context) {
     context.dataStore.edit { it[Keys.PREFER_HTTPS] = prefer }
   }
 
+  suspend fun updateActivityLoggingEnabled(enabled: Boolean) {
+    context.dataStore.edit { it[Keys.ACTIVITY_LOGGING_ENABLED] = enabled }
+  }
+
   suspend fun applyBackupPreferences(entry: com.example.domain.model.BackupPreferencesEntry) {
     context.dataStore.edit { prefs ->
       prefs[Keys.THEME_MODE] = entry.themeMode.name
@@ -106,6 +112,7 @@ class PreferencesRepository(private val context: Context) {
       prefs[Keys.SOURCE_TIMEOUT_SECONDS] = entry.sourceTimeoutSeconds.coerceIn(5, 30)
       prefs[Keys.MAX_CONCURRENT_SOURCES] = entry.maxConcurrentSources.coerceIn(1, 8)
       prefs[Keys.PREFER_HTTPS] = entry.preferHttps
+      prefs[Keys.ACTIVITY_LOGGING_ENABLED] = entry.activityLoggingEnabled
     }
   }
 }

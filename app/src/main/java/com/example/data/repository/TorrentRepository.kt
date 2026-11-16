@@ -12,6 +12,8 @@ import com.example.data.local.db.FavoriteTorrentEntity
 import com.example.data.local.db.SearchHistoryEntity
 import com.example.data.local.db.TorrentSourceEntity
 import com.example.data.local.prefs.PreferencesRepository
+import com.example.data.logging.ActivityCategory
+import com.example.data.logging.ActivityLogger
 import com.example.data.network.TorrentHttpClient
 import com.example.data.parser.DetectedFeed
 import com.example.data.parser.DiscoveredSourceCandidate
@@ -88,7 +90,8 @@ class TorrentRepository(
   private val context: Context,
   private val database: AppDatabase,
   val httpClient: TorrentHttpClient,
-  private val imageLoader: ImageLoader
+  private val imageLoader: ImageLoader,
+  private val logger: ActivityLogger? = null
 ) {
   private val sourceDao = database.torrentSourceDao()
   private val favoriteDao = database.favoriteDao()
@@ -96,7 +99,7 @@ class TorrentRepository(
   private val cacheDao = database.cachedTorrentDao()
 
   val adapter = UnifiedSourceAdapter(httpClient)
-  val repairEngine = SourceRepairEngine(httpClient, adapter)
+  val repairEngine = SourceRepairEngine(httpClient, adapter, logger)
 
   private val json = Json {
     ignoreUnknownKeys = true
@@ -126,21 +129,32 @@ class TorrentRepository(
         source.previousWorkingConfigJson ?: existing?.previousWorkingConfigJson
       }
       sourceDao.upsert(source.copy(previousWorkingConfigJson = snapshotJson).toEntity())
+      logger?.info(
+        ActivityCategory.SYSTEM,
+        "Saved source '${source.name}'",
+        "Type: ${source.sourceType.label} | Base: ${source.baseUrl} | Enabled: ${source.enabled} | HTTP: ${source.allowCleartextHttp}"
+      )
     }
 
   suspend fun toggleSourceEnabled(sourceId: String, enabled: Boolean) = withContext(Dispatchers.IO) {
     val existing = sourceDao.getById(sourceId) ?: return@withContext
     sourceDao.upsert(existing.copy(enabled = enabled))
+    logger?.info(ActivityCategory.SYSTEM, "Toggled source '${existing.name}'", "Enabled: $enabled")
   }
 
   suspend fun deleteSource(sourceId: String) = withContext(Dispatchers.IO) {
     sourceDao.deleteById(sourceId)
+    logger?.info(ActivityCategory.SYSTEM, "Deleted source", "Source ID: $sourceId")
   }
 
   suspend fun restorePreviousSourceConfig(sourceId: String): Boolean = withContext(Dispatchers.IO) {
     val current = sourceDao.getById(sourceId)?.toDomain() ?: return@withContext false
     val prevJson = current.previousWorkingConfigJson ?: return@withContext false
-    val restored = runCatching { json.decodeFromString<TorrentSource>(prevJson) }.getOrNull()
+    val restored = runCatching { json.decodeFromString<TorrentSource>(prevJson) }
+      .onFailure { err ->
+        logger?.error(ActivityCategory.REPAIR, "Failed to deserialize previous config for '${current.name}'", err.localizedMessage ?: "JSON parse error", err)
+      }
+      .getOrNull()
       ?: return@withContext false
     sourceDao.upsert(
       restored.copy(
@@ -149,6 +163,7 @@ class TorrentRepository(
         lastError = null
       ).toEntity()
     )
+    logger?.info(ActivityCategory.REPAIR, "Restored previous configuration for '${current.name}'", "Restored base URL: ${restored.baseUrl}")
     true
   }
 
@@ -158,7 +173,9 @@ class TorrentRepository(
     allowCleartext: Boolean = false
   ): List<DetectedFeed> =
     withContext(Dispatchers.IO) {
-      adapter.detectFeedsFromWebsite(url, timeoutSeconds, allowCleartext = allowCleartext)
+      val feeds = adapter.detectFeedsFromWebsite(url, timeoutSeconds, allowCleartext = allowCleartext)
+      logger?.info(ActivityCategory.PARSER, "Feed auto-detection completed", "URL: $url | Feeds found: ${feeds.size}")
+      feeds
     }
 
   suspend fun discoverSourceFromUrl(
@@ -167,7 +184,13 @@ class TorrentRepository(
     allowCleartext: Boolean = false
   ): DiscoveredSourceCandidate =
     withContext(Dispatchers.IO) {
-      adapter.discoverSourceFromUrl(input, timeoutSeconds, allowCleartext = allowCleartext)
+      val res = adapter.discoverSourceFromUrl(input, timeoutSeconds, allowCleartext = allowCleartext)
+      if (res.source == null) {
+        logger?.warn(ActivityCategory.PARSER, "Source discovery did not match", "Input: $input | ${res.summary}")
+      } else {
+        logger?.info(ActivityCategory.PARSER, "Discovered source '${res.source.name}'", res.summary)
+      }
+      res
     }
 
   suspend fun testSingleSource(
@@ -202,8 +225,18 @@ class TorrentRepository(
     sourceDao.upsert(updated.toEntity())
 
     if (res.errorMessage == null) {
+      logger?.info(
+        ActivityCategory.SEARCH,
+        "Source test passed: ${source.name}",
+        "Items: ${res.items.size} | Duration: ${duration}ms | HTTP ${res.statusCode ?: 200}"
+      )
       SourceProgressState.Success(res.items.size, duration)
     } else {
+      logger?.error(
+        ActivityCategory.SEARCH,
+        "Source test failed: ${source.name}",
+        "HTTP ${res.statusCode ?: "N/A"} | Cloudflare: ${res.isCloudflareChallenge} | ${res.errorMessage}"
+      )
       SourceProgressState.Error(
         message = res.errorMessage,
         statusCode = res.statusCode,
@@ -347,8 +380,18 @@ class TorrentRepository(
             }
 
             val progress = if (result.errorMessage == null) {
+              logger?.info(
+                ActivityCategory.SEARCH,
+                "Search source OK: ${source.name}",
+                "Query='${query.trim()}' Page=$targetPage Items=${result.items.size} Time=${duration}ms"
+              )
               SourceProgressState.Success(result.items.size, duration)
             } else {
+              logger?.error(
+                ActivityCategory.SEARCH,
+                "Search source error: ${source.name}",
+                "Query='${query.trim()}' Page=$targetPage URL=${result.requestUrl} Error=${result.errorMessage}"
+              )
               SourceProgressState.Error(
                 message = result.errorMessage,
                 statusCode = result.statusCode,
@@ -654,6 +697,7 @@ class TorrentRepository(
 
   fun clearVerificationCookies() {
     httpClient.cookieJar.clearAllCookies()
+    logger?.info(ActivityCategory.VERIFICATION, "Cleared browser verification & session cookies", "")
   }
 
   suspend fun buildDiagnosticReportText(appVersion: String = ""): String = withContext(Dispatchers.IO) {
@@ -828,10 +872,14 @@ class TorrentRepository(
 
   fun parseAndValidateBackup(rawJson: String): Result<TorrentTrackerBackup> {
     if (rawJson.isBlank()) {
-      return Result.failure(IllegalArgumentException("Backup file is empty."))
+      val ex = IllegalArgumentException("Backup file is empty.")
+      logger?.error(ActivityCategory.BACKUP, "Backup validation failed", ex.message.orEmpty(), ex)
+      return Result.failure(ex)
     }
     if (rawJson.toByteArray(Charsets.UTF_8).size > MAX_BACKUP_BYTES) {
-      return Result.failure(IllegalArgumentException("Backup file exceeds 4 MB safety limit."))
+      val ex = IllegalArgumentException("Backup file exceeds 4 MB safety limit.")
+      logger?.error(ActivityCategory.BACKUP, "Backup validation failed", ex.message.orEmpty(), ex)
+      return Result.failure(ex)
     }
     return runCatching {
       val parsed = json.decodeFromString<TorrentTrackerBackup>(rawJson)
@@ -894,7 +942,19 @@ class TorrentRepository(
           }
         }
       }
+      logger?.info(
+        ActivityCategory.BACKUP,
+        "Validated backup file",
+        "Schema v${parsed.schemaVersion}: ${parsed.sources.size} sources, ${parsed.favorites.size} favorites, ${parsed.collections.size} collections"
+      )
       parsed
+    }.onFailure { err ->
+      logger?.error(
+        ActivityCategory.BACKUP,
+        "Backup validation error",
+        err.localizedMessage ?: "Invalid backup JSON",
+        err
+      )
     }
   }
 
@@ -1063,7 +1123,13 @@ class TorrentRepository(
       collectionsRestored = collectionsRestored,
       historyRestored = historyRestored,
       preferencesRestored = prefsRestored
-    )
+    ).also {
+      logger?.info(
+        ActivityCategory.BACKUP,
+        "Backup restored (${mode.label})",
+        "Sources=$sourcesRestored, Favorites=$favoritesRestored, Collections=$collectionsRestored, History=$historyRestored, Prefs=$prefsRestored"
+      )
+    }
   }
 
   companion object {
@@ -1093,10 +1159,12 @@ class TorrentRepository(
     imageLoader.memoryCache?.clear()
     imageLoader.diskCache?.clear()
     File(context.cacheDir, "image_cache").deleteRecursively()
+    logger?.info(ActivityCategory.STORAGE, "Cleared image cache", "")
   }
 
   suspend fun clearTemporaryCache() = withContext(Dispatchers.IO) {
     cacheDao.clearAll()
+    logger?.info(ActivityCategory.STORAGE, "Cleared temporary search cache", "")
   }
 
   private fun folderSize(dir: File?): Long {

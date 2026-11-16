@@ -40,6 +40,7 @@ import com.example.domain.model.TorrentItem
 import com.example.ui.components.DrawerDestination
 import com.example.ui.components.NavigationDrawerContent
 import com.example.ui.screens.AboutScreen
+import com.example.ui.screens.ActivityLogScreen
 import com.example.ui.screens.CloudflareVerificationScreen
 import com.example.ui.screens.FavoritesScreen
 import com.example.ui.screens.HomeSearchScreen
@@ -63,6 +64,7 @@ import kotlinx.serialization.Serializable
 @Serializable data class CloudflareVerifyRoute(val sourceId: String)
 @Serializable data object SearchHistoryRoute
 @Serializable data object SettingsRoute
+@Serializable data object ActivityLogRoute
 @Serializable data object AboutRoute
 
 @Composable
@@ -91,6 +93,7 @@ fun AppNavigation(
   val pendingImportBackup by settingsViewModel.pendingImportBackup.collectAsStateWithLifecycle()
   val isProcessingBackup by settingsViewModel.isProcessingBackup.collectAsStateWithLifecycle()
   val settingsFeedback by settingsViewModel.feedbackMessage.collectAsStateWithLifecycle()
+  val activityLogs by settingsViewModel.activityLogs.collectAsStateWithLifecycle()
 
   val backStackEntry by navController.currentBackStackEntryAsState()
   val routeStr = backStackEntry?.destination?.route.orEmpty()
@@ -98,7 +101,7 @@ fun AppNavigation(
     routeStr.contains("FavoritesRoute") -> "favorites"
     routeStr.contains("SourcesRoute") -> "sources"
     routeStr.contains("SearchHistoryRoute") -> "history"
-    routeStr.contains("SettingsRoute") -> "settings"
+    routeStr.contains("SettingsRoute") || routeStr.contains("ActivityLogRoute") -> "settings"
     routeStr.contains("AboutRoute") -> "about"
     else -> "home"
   }
@@ -329,7 +332,8 @@ fun AppNavigation(
                 source = src,
                 onBack = { navController.popBackStack() },
                 onVerifyAndRetrySource = sourcesViewModel::retryAfterCloudflareVerification,
-                onFeedback = ::showToast
+                onFeedback = ::showToast,
+                onLogVerificationEvent = settingsViewModel::logVerificationEvent
               )
             }
 
@@ -375,12 +379,29 @@ fun AppNavigation(
                 onClearTempCache = settingsViewModel::clearTemporaryCache,
                 onClearCookies = settingsViewModel::clearVerificationCookies,
                 onBuildDiagnosticReport = settingsViewModel::buildDiagnosticReportText,
+                activityLogs = activityLogs,
+                onActivityLoggingChanged = settingsViewModel::setActivityLoggingEnabled,
+                onOpenActivityLog = { navController.navigate(ActivityLogRoute) },
+                onBuildActivityLogText = settingsViewModel::buildActivityLogText,
+                onClearActivityLogs = settingsViewModel::clearActivityLogs,
                 onBuildBackupJson = settingsViewModel::buildBackupJson,
                 onLoadImportJson = settingsViewModel::loadBackupForPreview,
                 onConfirmRestoreBackup = settingsViewModel::confirmRestoreBackup,
                 onDismissImportPreview = settingsViewModel::dismissImportPreview,
                 onBackupFeedback = settingsViewModel::notifyFeedback,
                 onOpenAbout = { navController.navigate(AboutRoute) }
+              )
+            }
+
+            composable<ActivityLogRoute> {
+              ActivityLogScreen(
+                entries = activityLogs,
+                loggingEnabled = preferences.activityLoggingEnabled,
+                onToggleLogging = settingsViewModel::setActivityLoggingEnabled,
+                onClearLogs = settingsViewModel::clearActivityLogs,
+                onBuildLogText = settingsViewModel::buildActivityLogText,
+                onFeedback = ::showToast,
+                onBack = { navController.popBackStack() }
               )
             }
 

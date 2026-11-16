@@ -5,6 +5,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
 import com.example.data.local.prefs.PreferencesRepository
+import com.example.data.logging.ActivityCategory
+import com.example.data.logging.ActivityLogEntry
+import com.example.data.logging.ActivityLogger
 import com.example.data.repository.TorrentRepository
 import com.example.domain.model.AccentColorOption
 import com.example.domain.model.BackupSelection
@@ -28,7 +31,8 @@ import kotlinx.coroutines.launch
 
 class SettingsViewModel(
   private val preferencesRepository: PreferencesRepository,
-  private val torrentRepository: TorrentRepository
+  private val torrentRepository: TorrentRepository,
+  private val activityLogger: ActivityLogger? = null
 ) : ViewModel() {
 
   val preferences: StateFlow<UserPreferences> = preferencesRepository.preferencesFlow
@@ -52,6 +56,9 @@ class SettingsViewModel(
   private val _feedbackMessage = MutableStateFlow<String?>(null)
   val feedbackMessage: StateFlow<String?> = _feedbackMessage.asStateFlow()
 
+  val activityLogs: StateFlow<List<ActivityLogEntry>> =
+    activityLogger?.entries ?: MutableStateFlow<List<ActivityLogEntry>>(emptyList()).asStateFlow()
+
   init {
     refreshStorageStats()
   }
@@ -72,6 +79,36 @@ class SettingsViewModel(
   fun setSourceTimeout(seconds: Int) = viewModelScope.launch { preferencesRepository.updateSourceTimeoutSeconds(seconds) }
   fun setMaxConcurrency(count: Int) = viewModelScope.launch { preferencesRepository.updateMaxConcurrentSources(count) }
   fun setPreferHttps(prefer: Boolean) = viewModelScope.launch { preferencesRepository.updatePreferHttps(prefer) }
+
+  fun setActivityLoggingEnabled(enabled: Boolean) {
+    activityLogger?.setEnabled(enabled)
+    viewModelScope.launch {
+      preferencesRepository.updateActivityLoggingEnabled(enabled)
+      _feedbackMessage.value = if (enabled) {
+        "Activity & error logging enabled"
+      } else {
+        "Activity & error logging paused"
+      }
+    }
+  }
+
+  fun buildActivityLogText(): String {
+    return activityLogger?.formatReportText(BuildConfig.VERSION_NAME)
+      ?: "Torrent Tracker Activity & Error Log\nNo logger attached."
+  }
+
+  fun clearActivityLogs() {
+    activityLogger?.clear()
+    _feedbackMessage.value = "Activity & error log cleared"
+  }
+
+  fun logVerificationEvent(isError: Boolean, action: String, detail: String) {
+    if (isError) {
+      activityLogger?.error(ActivityCategory.VERIFICATION, action, detail)
+    } else {
+      activityLogger?.info(ActivityCategory.VERIFICATION, action, detail)
+    }
+  }
 
   fun clearImageCache() {
     viewModelScope.launch {
@@ -164,6 +201,12 @@ class SettingsViewModel(
         }
         _feedbackMessage.value = "Restored (${mode.label}): ${parts.joinToString(", ").ifBlank { "no items" }}"
       }.onFailure { err ->
+        activityLogger?.error(
+          ActivityCategory.BACKUP,
+          "Backup restore failed",
+          err.localizedMessage ?: "Database error",
+          err
+        )
         _feedbackMessage.value = "Restore failed: ${err.localizedMessage ?: "Database error"}"
       }
       _isProcessingBackup.value = false
@@ -180,11 +223,12 @@ class SettingsViewModel(
 
   class Factory(
     private val preferencesRepository: PreferencesRepository,
-    private val torrentRepository: TorrentRepository
+    private val torrentRepository: TorrentRepository,
+    private val activityLogger: ActivityLogger? = null
   ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-      return SettingsViewModel(preferencesRepository, torrentRepository) as T
+      return SettingsViewModel(preferencesRepository, torrentRepository, activityLogger) as T
     }
   }
 }

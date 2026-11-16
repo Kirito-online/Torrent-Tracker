@@ -9,6 +9,9 @@ import org.robolectric.Shadows
 import coil.ImageLoader
 import com.example.data.local.db.AppDatabase
 import com.example.data.local.prefs.PreferencesRepository
+import com.example.data.logging.ActivityCategory
+import com.example.data.logging.ActivityLogLevel
+import com.example.data.logging.ActivityLogger
 import com.example.data.network.TorrentHttpClient
 import com.example.data.network.WebViewCookieJar
 import com.example.data.parser.SourceRepairEngine
@@ -33,6 +36,7 @@ import com.example.domain.model.TorrentItem
 import com.example.domain.model.TorrentSource
 import com.example.domain.model.UserPreferences
 import com.example.ui.viewmodel.SearchViewModel
+import com.example.ui.viewmodel.SettingsViewModel
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -1049,5 +1053,107 @@ class TorrentTrackerReliabilityTest {
     assertTrue(diagText.contains("ZeroParse"))
     assertTrue(diagText.contains("Cookies", ignoreCase = true))
     assertFalse(diagText.contains("tok123"))
+  }
+
+  // 14. ActivityLogger respects toggle, persists JSONL, caps capacity, redacts secrets, and formats export
+  @Test
+  fun `activity logger respects toggle persists to jsonl enforces cap redacts secrets and formats report`() {
+    val logFile = File(context.cacheDir, "test_activity_log_${System.nanoTime()}.jsonl")
+    try {
+      val logger = ActivityLogger(logFile = logFile, initialEnabled = false, maxEntries = 3)
+      logger.info(ActivityCategory.SEARCH, "Ignored when disabled", "should not be recorded")
+      assertEquals(0, logger.entries.value.size)
+
+      logger.setEnabled(true) // logs 1st event ("Activity & error logging enabled")
+      logger.warn(
+        ActivityCategory.NETWORK,
+        "Blocked request Cookie: cf_clearance=secret123",
+        "Set-Cookie: __cf_bm=topsecret99; Authorization: Bearer mytokenabc"
+      )
+      logger.error(
+        ActivityCategory.PARSER,
+        "Selector failed",
+        "cf_clearance=leak_value",
+        IllegalStateException("Container missing")
+      )
+      logger.info(ActivityCategory.BACKUP, "Backup exported", "2 sources")
+
+      val current = logger.entries.value
+      assertEquals(3, current.size) // capped to maxEntries=3
+      assertEquals(ActivityCategory.BACKUP, current.first().category) // newest first
+
+      val errorEntry = current.first { it.level == ActivityLogLevel.ERROR }
+      assertEquals("java.lang.IllegalStateException", errorEntry.throwableClass)
+      assertNotNull(errorEntry.stackSummary)
+      assertFalse(errorEntry.detail.contains("leak_value"))
+
+      // Reload from disk and verify secret redaction & persistence
+      val reloaded = ActivityLogger(logFile = logFile, initialEnabled = true, maxEntries = 3)
+      assertEquals(3, reloaded.entries.value.size)
+      val report = reloaded.formatReportText("1.0")
+      assertFalse(report.contains("secret123"))
+      assertFalse(report.contains("topsecret99"))
+      assertFalse(report.contains("mytokenabc"))
+      assertFalse(report.contains("leak_value"))
+      assertTrue(report.contains("[REDACTED]"))
+      assertTrue(report.contains("IllegalStateException"))
+
+      reloaded.clear()
+      assertEquals(0, reloaded.entries.value.size)
+      assertTrue(!logFile.exists() || logFile.readText().isBlank())
+    } finally {
+      logFile.delete()
+    }
+  }
+
+  // 15. SettingsViewModel toggles logging & captures HTTP, repair, and backup errors
+  @Test
+  fun `settings viewmodel toggles activity logging and captures http repair and backup errors`() = runBlocking {
+    val logFile = File(context.cacheDir, "test_vm_activity_${System.nanoTime()}.jsonl")
+    try {
+      val logger = ActivityLogger(logFile = logFile, initialEnabled = false)
+      val loggedHttpClient = TorrentHttpClient(logger = logger)
+      val loggedRepo = TorrentRepository(
+        context = context,
+        database = db,
+        httpClient = loggedHttpClient,
+        imageLoader = ImageLoader.Builder(context).build(),
+        logger = logger
+      )
+      val settingsVm = SettingsViewModel(prefsRepo, loggedRepo, logger)
+
+      settingsVm.setActivityLoggingEnabled(true)
+      delay(80)
+      assertTrue(prefsRepo.preferencesFlow.first().activityLoggingEnabled)
+      assertTrue(logger.isEnabled())
+
+      // Trigger an HTTP cleartext block, backup validation failure, and repair candidate failure
+      loggedHttpClient.fetch("http://blocked.example/rss", timeoutSeconds = 3, allowCleartext = false)
+      loggedRepo.parseAndValidateBackup("{bad json")
+      val brokenSource = TorrentSource(
+        id = "broken_logged",
+        name = "BrokenLogged",
+        baseUrl = "http://blocked.example",
+        searchUrlTemplate = "http://blocked.example/q={query}",
+        sourceType = SourceType.RSS_ATOM,
+        allowCleartextHttp = false
+      )
+      loggedRepo.testReplacementUrl("http://blocked.example/feed", brokenSource, timeoutSeconds = 3)
+
+      val logs = settingsVm.activityLogs.value
+      assertTrue("Expected multiple recorded events, got ${logs.size}", logs.size >= 4)
+      assertTrue(logs.any { it.category == ActivityCategory.NETWORK && it.level == ActivityLogLevel.WARN })
+      assertTrue(logs.any { it.category == ActivityCategory.BACKUP && it.level == ActivityLogLevel.ERROR })
+      assertTrue(logs.any { it.category == ActivityCategory.REPAIR && it.level == ActivityLogLevel.ERROR })
+
+      val exportedText = settingsVm.buildActivityLogText()
+      assertTrue(exportedText.contains("Backup validation error"))
+      assertTrue(exportedText.contains("Candidate test failed: BrokenLogged"))
+
+      settingsVm.clearActivityLogs()
+      assertEquals(0, settingsVm.activityLogs.value.size)
+    } finally {
+      logFile.delete()
+    }
   }
 }
